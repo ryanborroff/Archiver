@@ -1,7 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::{
+    ffi::CString,
     fs::{self, OpenOptions},
     io::{Read, Write},
+    os::unix::ffi::OsStrExt,
     path::{Component, Path, PathBuf},
     sync::{Mutex, OnceLock},
     time::{SystemTime, UNIX_EPOCH},
@@ -587,6 +589,49 @@ fn finalise_without_overwrite(
     }
 }
 
+#[cfg(target_os = "macos")]
+fn copy_file_with_metadata(
+    source_path: &Path,
+    temporary_path: &Path,
+) -> Result<(), TransferFailure> {
+    let source = CString::new(source_path.as_os_str().as_bytes())
+        .map_err(|_| TransferFailure::CopyFailed)?;
+    let destination = CString::new(temporary_path.as_os_str().as_bytes())
+        .map_err(|_| TransferFailure::CopyFailed)?;
+
+    // COPYFILE_ALL preserves file data plus macOS metadata such as
+    // timestamps, permissions, ACLs, extended attributes and resource forks.
+    //
+    // COPYFILE_EXCL ensures this operation can never replace an existing
+    // Archiver temporary file.
+    let flags = libc::COPYFILE_ACL
+        | libc::COPYFILE_STAT
+        | libc::COPYFILE_XATTR
+        | libc::COPYFILE_DATA
+        | libc::COPYFILE_EXCL;
+
+    let result = unsafe {
+        libc::copyfile(
+            source.as_ptr(),
+            destination.as_ptr(),
+            std::ptr::null_mut(),
+            flags,
+        )
+    };
+
+    if result != 0 {
+        return Err(TransferFailure::CopyFailed);
+    }
+
+    let temporary = fs::File::open(temporary_path).map_err(|_| TransferFailure::CopyFailed)?;
+
+    temporary
+        .sync_all()
+        .map_err(|_| TransferFailure::CopyFailed)?;
+
+    Ok(())
+}
+
 fn execute_file_transfer(
     source_root: &Path,
     destination_root: &Path,
@@ -624,25 +669,7 @@ fn execute_file_transfer(
         return Err(TransferFailure::TemporaryFileExists);
     }
 
-    let copy_result = (|| -> Result<(), TransferFailure> {
-        let mut source = fs::File::open(&source_path).map_err(|_| TransferFailure::CopyFailed)?;
-
-        let mut temporary = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary_path)
-            .map_err(|_| TransferFailure::CopyFailed)?;
-
-        std::io::copy(&mut source, &mut temporary).map_err(|_| TransferFailure::CopyFailed)?;
-
-        temporary.flush().map_err(|_| TransferFailure::CopyFailed)?;
-
-        temporary
-            .sync_all()
-            .map_err(|_| TransferFailure::CopyFailed)?;
-
-        Ok(())
-    })();
+    let copy_result = copy_file_with_metadata(&source_path, &temporary_path);
 
     if let Err(error) = copy_result {
         // This temp path was created by this transfer attempt, so it is safe
@@ -1279,6 +1306,64 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn transfer_preserves_macos_file_metadata() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        use std::process::Command;
+
+        let fixture = TestFixture::new("metadata-fidelity");
+
+        let file = fixture.create_source_file("fidelity.txt", b"fidelity data", 2020);
+        let source_path = fixture.source.join("fidelity.txt");
+
+        // Give the source a distinctive permission mode.
+        fs::set_permissions(&source_path, fs::Permissions::from_mode(0o640)).unwrap();
+
+        // Give it a known extended attribute.
+        let status = Command::new("/usr/bin/xattr")
+            .args(["-w", "com.archiver.test", "preserve-me"])
+            .arg(&source_path)
+            .status()
+            .unwrap();
+
+        assert!(status.success());
+
+        // Capture the source metadata immediately before transfer.
+        let source_metadata = fs::metadata(&source_path).unwrap();
+        let source_mtime_sec = source_metadata.mtime();
+        let source_mtime_nsec = source_metadata.mtime_nsec();
+        let source_mode = source_metadata.permissions().mode() & 0o777;
+
+        execute_file_transfer(&fixture.source, &fixture.destination, &file).unwrap();
+
+        let destination_path = fixture.destination.join("2020/fidelity.txt");
+
+        assert!(!source_path.exists());
+        assert_eq!(fs::read(&destination_path).unwrap(), b"fidelity data");
+
+        let destination_metadata = fs::metadata(&destination_path).unwrap();
+
+        assert_eq!(destination_metadata.mtime(), source_mtime_sec);
+        assert_eq!(destination_metadata.mtime_nsec(), source_mtime_nsec);
+        assert_eq!(
+            destination_metadata.permissions().mode() & 0o777,
+            source_mode
+        );
+
+        let output = Command::new("/usr/bin/xattr")
+            .args(["-p", "com.archiver.test"])
+            .arg(&destination_path)
+            .output()
+            .unwrap();
+
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap().trim_end(),
+            "preserve-me"
+        );
     }
 
     #[test]
