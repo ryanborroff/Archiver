@@ -25,6 +25,25 @@ type ScanResult = {
   skippedFiles: number;
 };
 
+type PlannedFile = {
+  source: string;
+  destination: string;
+  relativePath: string;
+  year: number;
+  size: number;
+  status: "ready" | "conflict" | "changed" | "missing";
+  detail: string | null;
+};
+
+type ArchivePlan = {
+  files: PlannedFile[];
+  readyFiles: number;
+  readySize: number;
+  conflicts: number;
+  changedFiles: number;
+  missingFiles: number;
+};
+
 function formatBytes(bytes: number) {
   if (bytes === 0) return "0 B";
 
@@ -47,6 +66,8 @@ function App() {
   const [error, setError] = useState("");
   const [showFiles, setShowFiles] = useState(false);
   const [selectedYear, setSelectedYear] = useState<number | null>(null);
+  const [plan, setPlan] = useState<ArchivePlan | null>(null);
+  const [planning, setPlanning] = useState(false);
 
   const cutoff = Number(cutoffYear);
   const canScan =
@@ -77,6 +98,7 @@ function App() {
     }
 
     setResult(null);
+    setPlan(null);
     setShowFiles(false);
     setSelectedYear(null);
     setError("");
@@ -87,6 +109,7 @@ function App() {
 
     setScanning(true);
     setError("");
+    setPlan(null);
     setShowFiles(false);
     setSelectedYear(null);
 
@@ -103,6 +126,28 @@ function App() {
       setError(String(reason));
     } finally {
       setScanning(false);
+    }
+  }
+
+  async function reviewArchive() {
+    if (!result || !source || !destination) return;
+
+    setPlanning(true);
+    setError("");
+
+    try {
+      const archivePlan = await invoke<ArchivePlan>("plan_archive", {
+        source,
+        archiveDestination: destination,
+        files: result.files,
+      });
+
+      setPlan(archivePlan);
+    } catch (reason) {
+      setPlan(null);
+      setError(String(reason));
+    } finally {
+      setPlanning(false);
     }
   }
 
@@ -153,6 +198,7 @@ function App() {
               onChange={(event) => {
                 setCutoffYear(event.currentTarget.value);
                 setResult(null);
+                setPlan(null);
                 setShowFiles(false);
                 setSelectedYear(null);
               }}
@@ -224,8 +270,12 @@ function App() {
                 {showFiles ? "Hide files" : "Preview all files"}
               </button>
 
-              <button className="archive-button" disabled>
-                Archive {formatBytes(result.totalSize)}
+              <button
+                className="archive-button"
+                disabled={result.totalFiles === 0 || planning}
+                onClick={reviewArchive}
+              >
+                {planning ? "Reviewing…" : "Review archive"}
               </button>
             </div>
 
@@ -286,6 +336,79 @@ function App() {
                 </div>
               </section>
             )}
+          </section>
+        )}
+
+        {plan && (
+          <section className="plan-panel">
+            <div className="plan-heading">
+              <div>
+                <div className="eyebrow">ARCHIVE PLAN</div>
+                <h2>
+                  {plan.conflicts === 0 &&
+                  plan.changedFiles === 0 &&
+                  plan.missingFiles === 0
+                    ? "Ready for review"
+                    : "Needs attention"}
+                </h2>
+              </div>
+
+              <div className="total">
+                <strong>{formatBytes(plan.readySize)}</strong>
+                <span>{plan.readyFiles.toLocaleString()} ready</span>
+              </div>
+            </div>
+
+            <div className="plan-summary">
+              <div>
+                <strong>{plan.readyFiles.toLocaleString()}</strong>
+                <span>Ready</span>
+              </div>
+              <div>
+                <strong>{plan.conflicts.toLocaleString()}</strong>
+                <span>Conflicts</span>
+              </div>
+              <div>
+                <strong>{plan.changedFiles.toLocaleString()}</strong>
+                <span>Changed</span>
+              </div>
+              <div>
+                <strong>{plan.missingFiles.toLocaleString()}</strong>
+                <span>Missing</span>
+              </div>
+            </div>
+
+            <div className="plan-list">
+              {plan.files.map((file) => (
+                <div
+                  className={`plan-row plan-${file.status}`}
+                  key={`${file.source}-${file.destination}`}
+                >
+                  <div className="plan-paths">
+                    <strong>{file.relativePath}</strong>
+                    <span>{file.source}</span>
+                    <span>→ {file.destination}</span>
+                    {file.detail && (
+                      <span className="plan-detail">{file.detail}</span>
+                    )}
+                  </div>
+
+                  <div className="plan-meta">
+                    <span>{file.status}</span>
+                    <span>{formatBytes(file.size)}</span>
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            <div className="plan-footer">
+              <span>
+                Review only. Archiver still cannot move or delete files.
+              </span>
+              <button className="archive-button" disabled>
+                Archive files
+              </button>
+            </div>
           </section>
         )}
 

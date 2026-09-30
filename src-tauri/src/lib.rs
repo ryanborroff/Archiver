@@ -1,11 +1,11 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
     fs,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ArchiveFile {
     name: String,
@@ -218,12 +218,153 @@ fn scan_archive(
     })
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PlannedFile {
+    source: String,
+    destination: String,
+    relative_path: String,
+    year: i32,
+    size: u64,
+    status: String,
+    detail: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ArchivePlan {
+    files: Vec<PlannedFile>,
+    ready_files: usize,
+    ready_size: u64,
+    conflicts: usize,
+    changed_files: usize,
+    missing_files: usize,
+}
+
+#[tauri::command]
+fn plan_archive(
+    source: String,
+    archive_destination: String,
+    files: Vec<ArchiveFile>,
+) -> Result<ArchivePlan, String> {
+    let root = fs::canonicalize(&source)
+        .map_err(|_| "The source folder is no longer available.".to_string())?;
+
+    let destination_root = PathBuf::from(&archive_destination);
+
+    if archive_destination.trim().is_empty() {
+        return Err("Choose an archive destination.".into());
+    }
+
+    // If the destination already exists, canonicalise it so path comparisons
+    // are based on the real filesystem location.
+    let canonical_destination = if destination_root.exists() {
+        Some(
+            fs::canonicalize(&destination_root)
+                .map_err(|_| "The archive destination is not available.".to_string())?,
+        )
+    } else {
+        None
+    };
+
+    if let Some(destination) = &canonical_destination {
+        if destination == &root {
+            return Err("The archive destination cannot be the source folder.".into());
+        }
+
+        if root.starts_with(destination) {
+            return Err("The source folder cannot be inside the archive destination.".into());
+        }
+    }
+
+    let mut planned = Vec::with_capacity(files.len());
+    let mut ready_files = 0usize;
+    let mut ready_size = 0u64;
+    let mut conflicts = 0usize;
+    let mut changed_files = 0usize;
+    let mut missing_files = 0usize;
+
+    for file in files {
+        let source_path = root.join(&file.relative_path);
+
+        // A relative path must never be allowed to escape the selected source.
+        if !source_path.starts_with(&root) {
+            return Err("An unsafe source path was found in the archive plan.".into());
+        }
+
+        let destination_path = destination_root
+            .join(file.year.to_string())
+            .join(&file.relative_path);
+
+        let (status, detail) = match fs::symlink_metadata(&source_path) {
+            Err(_) => {
+                missing_files += 1;
+                (
+                    "missing".to_string(),
+                    Some("Source file is no longer available.".to_string()),
+                )
+            }
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                changed_files += 1;
+                (
+                    "changed".to_string(),
+                    Some("Source is no longer the same regular file.".to_string()),
+                )
+            }
+            Ok(metadata) => {
+                let current_modified_ms = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+                    .map(|duration| duration.as_millis() as u64);
+
+                if metadata.len() != file.size || current_modified_ms != Some(file.modified_ms) {
+                    changed_files += 1;
+                    (
+                        "changed".to_string(),
+                        Some("File changed since the scan.".to_string()),
+                    )
+                } else if destination_path.exists() {
+                    conflicts += 1;
+                    (
+                        "conflict".to_string(),
+                        Some("A file or folder already exists at the destination.".to_string()),
+                    )
+                } else {
+                    ready_files += 1;
+                    ready_size += file.size;
+                    ("ready".to_string(), None)
+                }
+            }
+        };
+
+        planned.push(PlannedFile {
+            source: source_path.to_string_lossy().into_owned(),
+            destination: destination_path.to_string_lossy().into_owned(),
+            relative_path: file.relative_path,
+            year: file.year,
+            size: file.size,
+            status,
+            detail,
+        });
+    }
+
+    Ok(ArchivePlan {
+        files: planned,
+        ready_files,
+        ready_size,
+        conflicts,
+        changed_files,
+        missing_files,
+    })
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![scan_archive])
+        .invoke_handler(tauri::generate_handler![scan_archive, plan_archive])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

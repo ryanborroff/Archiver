@@ -358,3 +358,116 @@ button.year-row.selected {
 .file-row {
   grid-template-columns: minmax(0, 1fr) 110px 90px;
 }
+
+.plan-panel {
+  margin-top: 24px;
+  padding: 24px;
+  background: #fff;
+  border: 1px solid #e3e3e7;
+  border-radius: 16px;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.03);
+}
+
+.plan-heading {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-end;
+  gap: 24px;
+  padding-bottom: 20px;
+}
+
+.plan-summary {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  border-top: 1px solid #e8e8ed;
+  border-bottom: 1px solid #e8e8ed;
+}
+
+.plan-summary > div {
+  padding: 16px 0;
+}
+
+.plan-summary strong,
+.plan-summary span {
+  display: block;
+}
+
+.plan-summary strong {
+  font-size: 18px;
+}
+
+.plan-summary span {
+  margin-top: 2px;
+  color: #86868b;
+  font-size: 12px;
+}
+
+.plan-list {
+  max-height: 400px;
+  overflow-y: auto;
+}
+
+.plan-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 110px;
+  gap: 20px;
+  padding: 14px 0;
+  border-bottom: 1px solid #eeeeF0;
+  font-size: 12px;
+}
+
+.plan-paths {
+  min-width: 0;
+}
+
+.plan-paths strong,
+.plan-paths span {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.plan-paths span {
+  margin-top: 3px;
+  color: #86868b;
+}
+
+.plan-paths .plan-detail {
+  color: #8a1f11;
+  font-weight: 600;
+}
+
+.plan-meta {
+  text-align: right;
+}
+
+.plan-meta span {
+  display: block;
+  text-transform: capitalize;
+}
+
+.plan-meta span:last-child {
+  margin-top: 3px;
+  color: #86868b;
+}
+
+.plan-conflict .plan-meta span:first-child,
+.plan-changed .plan-meta span:first-child,
+.plan-missing .plan-meta span:first-child {
+  color: #8a1f11;
+  font-weight: 600;
+}
+
+.plan-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  padding-top: 20px;
+}
+
+.plan-footer > span {
+  color: #86868b;
+  font-size: 12px;
+}
