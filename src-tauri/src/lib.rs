@@ -287,16 +287,14 @@ fn plan_archive(
     let mut missing_files = 0usize;
 
     for file in files {
-        let source_path = root.join(&file.relative_path);
+        let relative_path = safe_relative_path(&file.relative_path)
+            .map_err(|_| "An unsafe source path was found in the archive plan.".to_string())?;
 
-        // A relative path must never be allowed to escape the selected source.
-        if !source_path.starts_with(&root) {
-            return Err("An unsafe source path was found in the archive plan.".into());
-        }
+        let source_path = root.join(&relative_path);
 
         let destination_path = destination_root
             .join(file.year.to_string())
-            .join(&file.relative_path);
+            .join(&relative_path);
 
         let (status, detail) = match fs::symlink_metadata(&source_path) {
             Err(_) => {
