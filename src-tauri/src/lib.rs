@@ -467,6 +467,82 @@ fn temporary_path_for(destination: &Path) -> Result<PathBuf, TransferFailure> {
     Ok(destination.with_file_name(format!(".{file_name}.archiver-part")))
 }
 
+fn prepare_destination_parent(
+    destination_root: &Path,
+    parent: &Path,
+) -> Result<(), TransferFailure> {
+    if !parent.starts_with(destination_root) {
+        return Err(TransferFailure::DestinationParentBlocked);
+    }
+
+    let relative = parent
+        .strip_prefix(destination_root)
+        .map_err(|_| TransferFailure::DestinationParentBlocked)?;
+
+    let mut current = destination_root.to_path_buf();
+
+    // The selected destination itself must be a real directory, not a symlink.
+    let root_metadata =
+        fs::symlink_metadata(&current).map_err(|_| TransferFailure::DestinationParentBlocked)?;
+
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        return Err(TransferFailure::DestinationParentBlocked);
+    }
+
+    for component in relative.components() {
+        let Component::Normal(component) = component else {
+            return Err(TransferFailure::DestinationParentBlocked);
+        };
+
+        current.push(component);
+
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    return Err(TransferFailure::DestinationParentBlocked);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match fs::create_dir(&current) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(_) => return Err(TransferFailure::DestinationParentBlocked),
+                }
+
+                // Re-read after creation. If another process won the race, it
+                // still has to be a genuine directory rather than a symlink.
+                let metadata = fs::symlink_metadata(&current)
+                    .map_err(|_| TransferFailure::DestinationParentBlocked)?;
+
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    return Err(TransferFailure::DestinationParentBlocked);
+                }
+            }
+            Err(_) => return Err(TransferFailure::DestinationParentBlocked),
+        }
+    }
+
+    Ok(())
+}
+
+fn finalise_without_overwrite(
+    temporary_path: &Path,
+    destination_path: &Path,
+) -> Result<(), TransferFailure> {
+    match fs::hard_link(temporary_path, destination_path) {
+        Ok(()) => {
+            // Both names now refer to the same verified file. Removing our
+            // private temporary name leaves the destination intact.
+            fs::remove_file(temporary_path).map_err(|_| TransferFailure::FinalizeFailed)?;
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            Err(TransferFailure::DestinationExists)
+        }
+        Err(_) => Err(TransferFailure::FinalizeFailed),
+    }
+}
+
 fn execute_file_transfer(
     source_root: &Path,
     destination_root: &Path,
@@ -493,7 +569,7 @@ fn execute_file_transfer(
         .parent()
         .ok_or(TransferFailure::DestinationParentBlocked)?;
 
-    fs::create_dir_all(parent).map_err(|_| TransferFailure::DestinationParentBlocked)?;
+    prepare_destination_parent(destination_root, parent)?;
 
     // Re-check after directory creation. Another process could have created the
     // destination between the first check and this point.
@@ -555,7 +631,12 @@ fn execute_file_transfer(
         return Err(TransferFailure::DestinationExists);
     }
 
-    fs::rename(&temporary_path, &destination_path).map_err(|_| TransferFailure::FinalizeFailed)?;
+    if let Err(error) = finalise_without_overwrite(&temporary_path, &destination_path) {
+        // The temporary file belongs to this transfer attempt. If finalisation
+        // fails, clean it up but never touch the destination.
+        let _ = fs::remove_file(&temporary_path);
+        return Err(error);
+    }
 
     // Only after the verified copy has its final name do we remove the source.
     if fs::remove_file(&source_path).is_err() {
@@ -1107,6 +1188,62 @@ mod tests {
 
         assert_eq!(recovered.state, JournalState::InProgress);
         assert_eq!(recovered.planned_files, 1);
+    }
+
+    #[test]
+    fn finalisation_never_overwrites_destination() {
+        let fixture = TestFixture::new("atomic-no-overwrite");
+
+        let temporary = fixture.destination.join(".report.txt.archiver-part");
+        let destination = fixture.destination.join("report.txt");
+
+        fs::write(&temporary, b"new archive data").unwrap();
+        fs::write(&destination, b"existing data").unwrap();
+
+        let result = finalise_without_overwrite(&temporary, &destination);
+
+        assert_eq!(result, Err(TransferFailure::DestinationExists));
+        assert_eq!(fs::read(&destination).unwrap(), b"existing data");
+        assert_eq!(fs::read(&temporary).unwrap(), b"new archive data");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn destination_parent_rejects_symlinked_component() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = TestFixture::new("destination-symlink");
+        let outside = fixture.root.join("outside");
+        fs::create_dir_all(&outside).unwrap();
+
+        let year = fixture.destination.join("2020");
+        fs::create_dir_all(&year).unwrap();
+
+        let linked = year.join("Accounts");
+        symlink(&outside, &linked).unwrap();
+
+        let result = prepare_destination_parent(&fixture.destination, &linked);
+
+        assert_eq!(result, Err(TransferFailure::DestinationParentBlocked));
+    }
+
+    #[test]
+    fn destination_parent_creates_normal_directories() {
+        let fixture = TestFixture::new("destination-parent");
+
+        let parent = fixture
+            .destination
+            .join("2020")
+            .join("Accounts")
+            .join("Tax");
+
+        prepare_destination_parent(&fixture.destination, &parent).unwrap();
+
+        assert!(parent.is_dir());
+        assert!(!fs::symlink_metadata(&parent)
+            .unwrap()
+            .file_type()
+            .is_symlink());
     }
 
     #[test]
