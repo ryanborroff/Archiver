@@ -398,6 +398,50 @@ fn modified_ms(metadata: &fs::Metadata) -> Option<u64> {
         .map(|duration| duration.as_millis() as u64)
 }
 
+fn validate_source_path(
+    source_root: &Path,
+    relative_path: &Path,
+) -> Result<PathBuf, TransferFailure> {
+    let root_metadata =
+        fs::symlink_metadata(source_root).map_err(|_| TransferFailure::SourceMissing)?;
+
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        return Err(TransferFailure::SourceChanged);
+    }
+
+    let mut current = source_root.to_path_buf();
+    let mut components = relative_path.components().peekable();
+
+    while let Some(component) = components.next() {
+        let Component::Normal(component) = component else {
+            return Err(TransferFailure::UnsafeRelativePath);
+        };
+
+        current.push(component);
+
+        let metadata =
+            fs::symlink_metadata(&current).map_err(|_| TransferFailure::SourceMissing)?;
+
+        if metadata.file_type().is_symlink() {
+            return Err(TransferFailure::SourceChanged);
+        }
+
+        if components.peek().is_some() {
+            if !metadata.is_dir() {
+                return Err(TransferFailure::SourceChanged);
+            }
+        } else if !metadata.is_file() {
+            return Err(TransferFailure::SourceChanged);
+        }
+    }
+
+    if current == source_root {
+        return Err(TransferFailure::UnsafeRelativePath);
+    }
+
+    Ok(current)
+}
+
 fn verify_source(
     source_path: &Path,
     expected_size: u64,
@@ -549,11 +593,7 @@ fn execute_file_transfer(
     file: &ArchiveFile,
 ) -> Result<(), TransferFailure> {
     let relative_path = safe_relative_path(&file.relative_path)?;
-    let source_path = source_root.join(&relative_path);
-
-    if !source_path.starts_with(source_root) {
-        return Err(TransferFailure::UnsafeRelativePath);
-    }
+    let source_path = validate_source_path(source_root, &relative_path)?;
 
     verify_source(&source_path, file.size, file.modified_ms)?;
 
@@ -1008,7 +1048,8 @@ fn preflight_archive_execution(
         let relative_path = safe_relative_path(&file.relative_path)
             .map_err(|_| "The archive plan contains an unsafe file path.".to_string())?;
 
-        let source_path = source_root.join(&relative_path);
+        let source_path = validate_source_path(source_root, &relative_path)
+            .map_err(|error| failure_message(&error).to_string())?;
 
         verify_source(&source_path, file.size, file.modified_ms)
             .map_err(|error| failure_message(&error).to_string())?;
@@ -1452,6 +1493,70 @@ mod tests {
         let result = prepare_destination_parent(&fixture.destination, &linked);
 
         assert_eq!(result, Err(TransferFailure::DestinationParentBlocked));
+    }
+
+    #[test]
+    fn source_path_accepts_normal_nested_file() {
+        let fixture = TestFixture::new("source-path-normal");
+        fixture.create_source_file("Accounts/Tax/report.txt", b"report", 2020);
+
+        let relative = Path::new("Accounts/Tax/report.txt");
+
+        let validated = validate_source_path(&fixture.source, relative).unwrap();
+
+        assert_eq!(validated, fixture.source.join("Accounts/Tax/report.txt"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_path_rejects_symlinked_parent() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = TestFixture::new("source-parent-symlink");
+
+        let outside = fixture.root.join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("report.txt"), b"outside").unwrap();
+
+        symlink(&outside, fixture.source.join("Accounts")).unwrap();
+
+        let result = validate_source_path(&fixture.source, Path::new("Accounts/report.txt"));
+
+        assert_eq!(result, Err(TransferFailure::SourceChanged));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transfer_refuses_symlinked_source_parent() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = TestFixture::new("transfer-source-parent-symlink");
+
+        let outside = fixture.root.join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        let outside_file = outside.join("report.txt");
+        fs::write(&outside_file, b"report").unwrap();
+
+        let metadata = fs::metadata(&outside_file).unwrap();
+
+        symlink(&outside, fixture.source.join("Accounts")).unwrap();
+
+        let file = ArchiveFile {
+            name: "report.txt".into(),
+            relative_path: "Accounts/report.txt".into(),
+            size: metadata.len(),
+            modified_ms: modified_ms(&metadata).unwrap(),
+            year: 2020,
+        };
+
+        let result = execute_file_transfer(&fixture.source, &fixture.destination, &file);
+
+        assert_eq!(result, Err(TransferFailure::SourceChanged));
+        assert_eq!(fs::read(&outside_file).unwrap(), b"report");
+        assert!(!fixture
+            .destination
+            .join("2020/Accounts/report.txt")
+            .exists());
     }
 
     #[test]
