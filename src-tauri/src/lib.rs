@@ -873,6 +873,15 @@ enum JournalState {
     Completed,
 }
 
+#[derive(Debug, Clone, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct JournalActiveFile {
+    relative_path: String,
+    size: u64,
+    modified_ms: u64,
+    year: i32,
+}
+
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ArchiveJournal {
@@ -885,7 +894,7 @@ struct ArchiveJournal {
     destination_root: String,
     planned_files: usize,
     planned_size: u64,
-    active_file: Option<String>,
+    active_file: Option<JournalActiveFile>,
     result: ExecutionResult,
 }
 
@@ -990,7 +999,7 @@ fn create_archive_journal(
     }
 
     let journal = ArchiveJournal {
-        version: 3,
+        version: 4,
         operation_id,
         created_ms,
         updated_ms: created_ms,
@@ -1011,9 +1020,14 @@ fn create_archive_journal(
 fn set_journal_active_file(
     path: &Path,
     journal: &mut ArchiveJournal,
-    relative_path: &str,
+    file: &ArchiveFile,
 ) -> Result<(), String> {
-    journal.active_file = Some(relative_path.to_string());
+    journal.active_file = Some(JournalActiveFile {
+        relative_path: file.relative_path.clone(),
+        size: file.size,
+        modified_ms: file.modified_ms,
+        year: file.year,
+    });
     journal.updated_ms = current_time_ms()?;
 
     persist_journal(path, journal)
@@ -1225,7 +1239,7 @@ fn execute_archive_operation(
         // Persist which file is about to be transferred before touching it.
         // If the process stops during the transfer, recovery can inspect this
         // exact source/destination pair rather than guessing.
-        set_journal_active_file(&journal_path, &mut journal, &file.relative_path)?;
+        set_journal_active_file(&journal_path, &mut journal, file)?;
 
         let item = match execute_file_transfer(&source_root, &destination_root, file) {
             Ok(()) => ExecutionItem {
@@ -1551,7 +1565,7 @@ mod tests {
             create_archive_journal(&fixture.destination, &fixture.source, &[file]).unwrap();
 
         assert!(path.exists());
-        assert_eq!(journal.version, 3);
+        assert_eq!(journal.version, 4);
         assert_eq!(journal.state, JournalState::InProgress);
         assert_eq!(journal.planned_files, 1);
         assert_eq!(journal.planned_size, 6);
@@ -1887,16 +1901,58 @@ mod tests {
         let fixture = TestFixture::new("journal-active");
         let file = fixture.create_source_file("Accounts/tax.pdf", b"tax", 2020);
 
-        let (path, mut journal) =
-            create_archive_journal(&fixture.destination, &fixture.source, &[file]).unwrap();
+        let (path, mut journal) = create_archive_journal(
+            &fixture.destination,
+            &fixture.source,
+            std::slice::from_ref(&file),
+        )
+        .unwrap();
 
-        set_journal_active_file(&path, &mut journal, "Accounts/tax.pdf").unwrap();
+        set_journal_active_file(&path, &mut journal, &file).unwrap();
 
         let recovered = read_archive_journal(&path).unwrap();
 
-        assert_eq!(recovered.active_file.as_deref(), Some("Accounts/tax.pdf"));
+        assert_eq!(
+            recovered
+                .active_file
+                .as_ref()
+                .map(|active| active.relative_path.as_str()),
+            Some("Accounts/tax.pdf")
+        );
         assert_eq!(recovered.state, JournalState::InProgress);
         assert!(recovered.result.items.is_empty());
+    }
+
+    #[test]
+    fn journal_persists_active_file_snapshot() {
+        let fixture = TestFixture::new("journal-active-snapshot");
+        let file = fixture.create_source_file("Accounts/tax.pdf", b"tax-data", 2020);
+
+        let expected_path = file.relative_path.clone();
+        let expected_size = file.size;
+        let expected_modified_ms = file.modified_ms;
+        let expected_year = file.year;
+
+        let (path, mut journal) = create_archive_journal(
+            &fixture.destination,
+            &fixture.source,
+            std::slice::from_ref(&file),
+        )
+        .unwrap();
+
+        set_journal_active_file(&path, &mut journal, &file).unwrap();
+
+        // Read it back from disk rather than inspecting the in-memory journal.
+        let recovered = read_archive_journal(&path).unwrap();
+        let active = recovered
+            .active_file
+            .expect("active file snapshot should be persisted");
+
+        assert_eq!(recovered.version, 4);
+        assert_eq!(active.relative_path, expected_path);
+        assert_eq!(active.size, expected_size);
+        assert_eq!(active.modified_ms, expected_modified_ms);
+        assert_eq!(active.year, expected_year);
     }
 
     #[test]
@@ -1904,10 +1960,14 @@ mod tests {
         let fixture = TestFixture::new("journal-active-clear");
         let file = fixture.create_source_file("report.txt", b"report", 2020);
 
-        let (path, mut journal) =
-            create_archive_journal(&fixture.destination, &fixture.source, &[file]).unwrap();
+        let (path, mut journal) = create_archive_journal(
+            &fixture.destination,
+            &fixture.source,
+            std::slice::from_ref(&file),
+        )
+        .unwrap();
 
-        set_journal_active_file(&path, &mut journal, "report.txt").unwrap();
+        set_journal_active_file(&path, &mut journal, &file).unwrap();
 
         append_journal_result(
             &path,
@@ -2012,16 +2072,26 @@ mod tests {
         let fixture = TestFixture::new("journal-interrupted-active");
         let file = fixture.create_source_file("unfinished.txt", b"unfinished", 2020);
 
-        let (path, mut journal) =
-            create_archive_journal(&fixture.destination, &fixture.source, &[file]).unwrap();
+        let (path, mut journal) = create_archive_journal(
+            &fixture.destination,
+            &fixture.source,
+            std::slice::from_ref(&file),
+        )
+        .unwrap();
 
-        set_journal_active_file(&path, &mut journal, "unfinished.txt").unwrap();
+        set_journal_active_file(&path, &mut journal, &file).unwrap();
 
         // Simulate process termination before a result can be recorded.
         let recovered = read_archive_journal(&path).unwrap();
 
         assert_eq!(recovered.state, JournalState::InProgress);
-        assert_eq!(recovered.active_file.as_deref(), Some("unfinished.txt"));
+        assert_eq!(
+            recovered
+                .active_file
+                .as_ref()
+                .map(|active| active.relative_path.as_str()),
+            Some("unfinished.txt")
+        );
         assert_eq!(recovered.result.archived_files, 0);
     }
 
