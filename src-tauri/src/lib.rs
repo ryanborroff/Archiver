@@ -3,6 +3,7 @@ use std::{
     fs::{self, OpenOptions},
     io::{Read, Write},
     path::{Component, Path, PathBuf},
+    sync::{Mutex, OnceLock},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -566,6 +567,237 @@ fn execute_file_transfer(
     Ok(())
 }
 
+static ARCHIVE_EXECUTION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+#[derive(Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+enum ExecutionStatus {
+    Archived,
+    SourceRetained,
+    Failed,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExecutionItem {
+    relative_path: String,
+    destination: String,
+    status: ExecutionStatus,
+    detail: Option<String>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExecutionResult {
+    items: Vec<ExecutionItem>,
+    archived_files: usize,
+    archived_size: u64,
+    source_retained_files: usize,
+    failed_files: usize,
+}
+
+fn failure_message(error: &TransferFailure) -> &'static str {
+    match error {
+        TransferFailure::UnsafeRelativePath => "Unsafe relative path.",
+        TransferFailure::SourceMissing => "Source file is missing.",
+        TransferFailure::SourceChanged => "Source file changed since the scan.",
+        TransferFailure::DestinationExists => "Destination already exists.",
+        TransferFailure::DestinationParentBlocked => "Destination folder could not be prepared.",
+        TransferFailure::TemporaryFileExists => "A temporary Archiver file already exists.",
+        TransferFailure::CopyFailed => "Copy failed.",
+        TransferFailure::VerificationFailed => "Copied file could not be verified.",
+        TransferFailure::FinalizeFailed => "Copied file could not be finalised.",
+        TransferFailure::SourceDeleteFailed => {
+            "Copy was verified and archived, but the source could not be removed."
+        }
+    }
+}
+
+fn destination_for_file(
+    destination_root: &Path,
+    file: &ArchiveFile,
+) -> Result<PathBuf, TransferFailure> {
+    let relative_path = safe_relative_path(&file.relative_path)?;
+
+    Ok(destination_root
+        .join(file.year.to_string())
+        .join(relative_path))
+}
+
+fn execute_archive_batch(
+    source_root: &Path,
+    destination_root: &Path,
+    files: &[ArchiveFile],
+) -> ExecutionResult {
+    let mut items = Vec::with_capacity(files.len());
+    let mut archived_files = 0usize;
+    let mut archived_size = 0u64;
+    let mut source_retained_files = 0usize;
+    let mut failed_files = 0usize;
+
+    for file in files {
+        let destination = destination_for_file(destination_root, file)
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_default();
+
+        match execute_file_transfer(source_root, destination_root, file) {
+            Ok(()) => {
+                archived_files += 1;
+                archived_size += file.size;
+
+                items.push(ExecutionItem {
+                    relative_path: file.relative_path.clone(),
+                    destination,
+                    status: ExecutionStatus::Archived,
+                    detail: None,
+                });
+            }
+            Err(TransferFailure::SourceDeleteFailed) => {
+                source_retained_files += 1;
+
+                items.push(ExecutionItem {
+                    relative_path: file.relative_path.clone(),
+                    destination,
+                    status: ExecutionStatus::SourceRetained,
+                    detail: Some(failure_message(&TransferFailure::SourceDeleteFailed).to_string()),
+                });
+            }
+            Err(error) => {
+                failed_files += 1;
+
+                items.push(ExecutionItem {
+                    relative_path: file.relative_path.clone(),
+                    destination,
+                    status: ExecutionStatus::Failed,
+                    detail: Some(failure_message(&error).to_string()),
+                });
+            }
+        }
+    }
+
+    ExecutionResult {
+        items,
+        archived_files,
+        archived_size,
+        source_retained_files,
+        failed_files,
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ArchiveManifest {
+    version: u32,
+    created_ms: u64,
+    source_root: String,
+    destination_root: String,
+    result: ExecutionResult,
+}
+
+fn current_time_ms() -> Result<u64, String> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .map_err(|_| "System clock is before the Unix epoch.".to_string())
+}
+
+fn manifest_path(destination_root: &Path, created_ms: u64) -> PathBuf {
+    destination_root
+        .join(".archiver")
+        .join("manifests")
+        .join(format!("archive-{created_ms}.json"))
+}
+
+fn write_manifest(
+    destination_root: &Path,
+    source_root: &Path,
+    result: &ExecutionResult,
+) -> Result<PathBuf, String> {
+    let created_ms = current_time_ms()?;
+    let final_path = manifest_path(destination_root, created_ms);
+
+    let parent = final_path
+        .parent()
+        .ok_or_else(|| "Could not determine manifest folder.".to_string())?;
+
+    fs::create_dir_all(parent).map_err(|_| "Could not create the manifest folder.".to_string())?;
+
+    let temp_path = final_path.with_extension("json.archiver-part");
+
+    if final_path.exists() || temp_path.exists() {
+        return Err("A manifest with this identifier already exists.".to_string());
+    }
+
+    let manifest = ArchiveManifest {
+        version: 1,
+        created_ms,
+        source_root: source_root.to_string_lossy().into_owned(),
+        destination_root: destination_root.to_string_lossy().into_owned(),
+        result: ExecutionResult {
+            items: result
+                .items
+                .iter()
+                .map(|item| ExecutionItem {
+                    relative_path: item.relative_path.clone(),
+                    destination: item.destination.clone(),
+                    status: match item.status {
+                        ExecutionStatus::Archived => ExecutionStatus::Archived,
+                        ExecutionStatus::SourceRetained => ExecutionStatus::SourceRetained,
+                        ExecutionStatus::Failed => ExecutionStatus::Failed,
+                    },
+                    detail: item.detail.clone(),
+                })
+                .collect(),
+            archived_files: result.archived_files,
+            archived_size: result.archived_size,
+            source_retained_files: result.source_retained_files,
+            failed_files: result.failed_files,
+        },
+    };
+
+    let bytes = serde_json::to_vec_pretty(&manifest)
+        .map_err(|_| "Could not serialize archive manifest.".to_string())?;
+
+    let write_result = (|| -> Result<(), String> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+            .map_err(|_| "Could not create temporary manifest.".to_string())?;
+
+        file.write_all(&bytes)
+            .map_err(|_| "Could not write archive manifest.".to_string())?;
+
+        file.flush()
+            .map_err(|_| "Could not flush archive manifest.".to_string())?;
+
+        file.sync_all()
+            .map_err(|_| "Could not sync archive manifest.".to_string())?;
+
+        Ok(())
+    })();
+
+    if let Err(error) = write_result {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error);
+    }
+
+    fs::rename(&temp_path, &final_path)
+        .map_err(|_| "Could not finalise archive manifest.".to_string())?;
+
+    Ok(final_path)
+}
+
+fn with_archive_execution_lock<T>(operation: impl FnOnce() -> T) -> Result<T, String> {
+    let lock = ARCHIVE_EXECUTION_LOCK.get_or_init(|| Mutex::new(()));
+
+    let _guard = lock
+        .try_lock()
+        .map_err(|_| "Another archive operation is already running.".to_string())?;
+
+    Ok(operation())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -632,6 +864,106 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+
+    #[test]
+    fn batch_archives_multiple_files() {
+        let fixture = TestFixture::new("batch-success");
+
+        let first = fixture.create_source_file("Accounts/a.txt", b"alpha", 2020);
+        let second = fixture.create_source_file("Insurance/b.txt", b"bravo", 2021);
+
+        let files = vec![first, second];
+
+        let result = execute_archive_batch(&fixture.source, &fixture.destination, &files);
+
+        assert_eq!(result.archived_files, 2);
+        assert_eq!(result.failed_files, 0);
+        assert_eq!(result.source_retained_files, 0);
+
+        assert!(!fixture.source.join("Accounts/a.txt").exists());
+        assert!(!fixture.source.join("Insurance/b.txt").exists());
+
+        assert_eq!(
+            fs::read(fixture.destination.join("2020/Accounts/a.txt")).unwrap(),
+            b"alpha"
+        );
+        assert_eq!(
+            fs::read(fixture.destination.join("2021/Insurance/b.txt")).unwrap(),
+            b"bravo"
+        );
+    }
+
+    #[test]
+    fn batch_failure_does_not_prevent_other_safe_files() {
+        let fixture = TestFixture::new("batch-partial");
+
+        let first = fixture.create_source_file("good.txt", b"good", 2020);
+        let second = fixture.create_source_file("conflict.txt", b"source", 2020);
+
+        let conflict_destination = fixture.destination.join("2020/conflict.txt");
+        fs::create_dir_all(conflict_destination.parent().unwrap()).unwrap();
+        fs::write(&conflict_destination, b"existing").unwrap();
+
+        let files = vec![first, second];
+
+        let result = execute_archive_batch(&fixture.source, &fixture.destination, &files);
+
+        assert_eq!(result.archived_files, 1);
+        assert_eq!(result.failed_files, 1);
+        assert_eq!(result.source_retained_files, 0);
+
+        assert!(!fixture.source.join("good.txt").exists());
+        assert!(fixture.source.join("conflict.txt").exists());
+
+        assert_eq!(
+            fs::read(fixture.destination.join("2020/good.txt")).unwrap(),
+            b"good"
+        );
+        assert_eq!(fs::read(conflict_destination).unwrap(), b"existing");
+    }
+
+    #[test]
+    fn execution_lock_rejects_concurrent_operation() {
+        let lock = ARCHIVE_EXECUTION_LOCK.get_or_init(|| Mutex::new(()));
+        let guard = lock.lock().unwrap();
+
+        let result = with_archive_execution_lock(|| 42);
+
+        assert_eq!(
+            result,
+            Err("Another archive operation is already running.".to_string())
+        );
+
+        drop(guard);
+
+        assert_eq!(with_archive_execution_lock(|| 42), Ok(42));
+    }
+
+    #[test]
+    fn manifest_records_completed_batch() {
+        let fixture = TestFixture::new("manifest");
+        let file = fixture.create_source_file("Accounts/report.txt", b"report", 2020);
+
+        let result = execute_archive_batch(&fixture.source, &fixture.destination, &[file]);
+
+        let manifest_path = write_manifest(&fixture.destination, &fixture.source, &result).unwrap();
+
+        assert!(manifest_path.exists());
+
+        let bytes = fs::read(&manifest_path).unwrap();
+        let manifest: ArchiveManifest = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(manifest.version, 1);
+        assert_eq!(manifest.result.archived_files, 1);
+        assert_eq!(manifest.result.failed_files, 0);
+        assert_eq!(manifest.result.source_retained_files, 0);
+        assert_eq!(manifest.result.items.len(), 1);
+        assert_eq!(
+            manifest.result.items[0].relative_path,
+            "Accounts/report.txt"
+        );
+        assert_eq!(manifest.result.items[0].status, ExecutionStatus::Archived);
     }
 
     #[test]
