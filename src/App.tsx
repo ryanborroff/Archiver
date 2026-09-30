@@ -64,6 +64,48 @@ type ArchiveExecutionResponse = {
   journalPath: string;
 };
 
+type RecoveryDiscoveryItem = {
+  journalPath: string;
+  operationId: string;
+  relativePath: string | null;
+  status:
+    | "sourceVerified"
+    | "temporaryVerified"
+    | "destinationVerified"
+    | "destinationPlausible"
+    | "sourceChanged"
+    | "temporaryUnverified"
+    | "destinationUnverified"
+    | "missing"
+    | "ambiguous"
+    | "noActiveFile";
+};
+
+function recoveryMessage(status: RecoveryDiscoveryItem["status"]) {
+  switch (status) {
+    case "sourceVerified":
+      return "The original file is intact.";
+    case "temporaryVerified":
+      return "A verified temporary copy was found. The original file is intact.";
+    case "destinationVerified":
+      return "The archived copy matches the original file.";
+    case "destinationPlausible":
+      return "An archived copy was found, but it cannot be fully verified.";
+    case "sourceChanged":
+      return "The original file has changed since the archive started.";
+    case "temporaryUnverified":
+      return "An incomplete or unverified temporary copy was found.";
+    case "destinationUnverified":
+      return "The archived copy could not be verified.";
+    case "missing":
+      return "The file could not be found in its original or archive location.";
+    case "ambiguous":
+      return "The interrupted archive needs manual checking.";
+    case "noActiveFile":
+      return "The earlier archive stopped between files.";
+  }
+}
+
 function formatBytes(bytes: number) {
   if (bytes === 0) return "0 B";
 
@@ -92,6 +134,8 @@ function App() {
   const [archiving, setArchiving] = useState(false);
   const [execution, setExecution] =
     useState<ArchiveExecutionResponse | null>(null);
+  const [recoveryItems, setRecoveryItems] = useState<RecoveryDiscoveryItem[]>([]);
+  const [checkingRecovery, setCheckingRecovery] = useState(false);
 
   const cutoff = Number(cutoffYear);
   const canScan =
@@ -120,6 +164,8 @@ function App() {
       setSource(selected);
     } else {
       setDestination(selected);
+      setRecoveryItems([]);
+      setCheckingRecovery(true);
     }
 
     setResult(null);
@@ -129,6 +175,24 @@ function App() {
     setShowFiles(false);
     setSelectedYear(null);
     setError("");
+
+    if (kind === "destination") {
+      try {
+        const recovery = await invoke<RecoveryDiscoveryItem[]>(
+          "discover_archive_recovery",
+          {
+            archiveDestination: selected,
+          },
+        );
+
+        setRecoveryItems(recovery);
+      } catch (reason) {
+        setRecoveryItems([]);
+        setError(`Could not check previous archives: ${String(reason)}`);
+      } finally {
+        setCheckingRecovery(false);
+      }
+    }
   }
 
   async function scan() {
@@ -289,6 +353,33 @@ function App() {
               <span className="choose">Choose</span>
             </button>
           </div>
+
+          {checkingRecovery && (
+            <div className="recovery-notice" role="status">
+              <strong>Checking previous archives…</strong>
+            </div>
+          )}
+
+          {!checkingRecovery && recoveryItems.length > 0 && (
+            <div className="recovery-notice" role="status">
+              <strong>
+                {recoveryItems.length === 1
+                  ? "Previous archive interrupted"
+                  : `${recoveryItems.length} previous archives were interrupted`}
+              </strong>
+
+              {recoveryItems.map((item) => (
+                <div className="recovery-item" key={item.operationId}>
+                  {item.relativePath && (
+                    <span className="recovery-path">{item.relativePath}</span>
+                  )}
+                  <span>{recoveryMessage(item.status)}</span>
+                </div>
+              ))}
+
+              <p>No files have been changed by this check.</p>
+            </div>
+          )}
 
           <div className="field cutoff-field">
             <label htmlFor="cutoff">Archive everything before</label>

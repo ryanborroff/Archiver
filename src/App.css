@@ -516,3 +516,33 @@ button.year-row.selected {
     justify-content: flex-end;
   }
 }
+
+.recovery-notice {
+  padding: 14px 16px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.recovery-notice strong {
+  display: block;
+  margin-bottom: 6px;
+}
+
+.recovery-notice p {
+  margin: 8px 0 0;
+  opacity: 0.65;
+}
+
+.recovery-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 8px;
+}
+
+.recovery-path {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  overflow-wrap: anywhere;
+}

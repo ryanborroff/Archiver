@@ -969,6 +969,20 @@ struct JournalActiveFile {
     year: i32,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ArchiveJournalHeader {
+    version: u32,
+    operation_id: String,
+    state: JournalState,
+}
+
+fn read_archive_journal_header(path: &Path) -> Result<ArchiveJournalHeader, String> {
+    let bytes = fs::read(path).map_err(|_| "Could not read archive journal.".to_string())?;
+
+    serde_json::from_slice(&bytes).map_err(|_| "Archive journal is not valid JSON.".to_string())
+}
+
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ArchiveJournal {
@@ -1230,7 +1244,22 @@ struct InterruptedJournalDiscovery {
 fn discover_interrupted_journals(
     destination_root: &Path,
 ) -> Result<Vec<InterruptedJournalDiscovery>, String> {
-    let manifests = destination_root.join(".archiver").join("manifests");
+    let archiver = destination_root.join(".archiver");
+    let manifests = archiver.join("manifests");
+
+    match fs::symlink_metadata(&archiver) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Vec::new());
+        }
+        Err(_) => {
+            return Err("Could not inspect archive metadata folder.".to_string());
+        }
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err("Archive metadata folder is unsafe.".to_string());
+            }
+        }
+    }
 
     match fs::symlink_metadata(&manifests) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -1266,17 +1295,24 @@ fn discover_interrupted_journals(
             continue;
         }
 
-        let journal = read_archive_journal(&path)?;
+        let header = read_archive_journal_header(&path)?;
 
-        if journal.state == JournalState::Completed {
+        if header.state == JournalState::Completed {
             continue;
+        }
+
+        if header.version != 4 {
+            return Err(format!(
+                "Unfinished archive journal {} uses version {} and needs manual inspection.",
+                header.operation_id, header.version
+            ));
         }
 
         let inspection = inspect_interrupted_journal(&path)?;
 
         discoveries.push(InterruptedJournalDiscovery {
             journal_path: path,
-            operation_id: journal.operation_id,
+            operation_id: header.operation_id,
             relative_path: inspection.as_ref().map(|value| value.relative_path.clone()),
             verification: inspection.map(|value| value.verification),
         });
@@ -2574,6 +2610,48 @@ mod tests {
     }
 
     #[test]
+    fn recovery_discovery_ignores_completed_version_3_journal() {
+        let fixture = TestFixture::new("completed-v3-recovery");
+
+        let manifests = fixture.destination.join(".archiver").join("manifests");
+        fs::create_dir_all(&manifests).unwrap();
+
+        let journal = manifests.join("archive-old-v3.json");
+
+        fs::write(
+            &journal,
+            format!(
+                r#"{{
+  "version": 3,
+  "operationId": "old-v3",
+  "createdMs": 1,
+  "updatedMs": 2,
+  "state": "completed",
+  "sourceRoot": "{}",
+  "destinationRoot": "{}",
+  "plannedFiles": 1,
+  "plannedSize": 10,
+  "activeFile": null,
+  "result": {{
+    "items": [],
+    "archivedFiles": 1,
+    "archivedSize": 10,
+    "sourceRetainedFiles": 0,
+    "failedFiles": 0
+  }}
+}}"#,
+                fixture.source.to_string_lossy(),
+                fixture.destination.to_string_lossy(),
+            ),
+        )
+        .unwrap();
+
+        let discoveries = discover_interrupted_journals(&fixture.destination).unwrap();
+
+        assert!(discoveries.is_empty());
+    }
+
+    #[test]
     fn recovery_discovery_ignores_completed_journal() {
         let fixture = TestFixture::new("discover-completed");
         let file = fixture.create_source_file("report.txt", b"report", 2020);
@@ -2593,6 +2671,22 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn recovery_discovery_rejects_symlinked_archiver_folder() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = TestFixture::new("recovery-symlinked-archiver");
+        let outside = fixture.root.join("outside-archiver");
+        fs::create_dir_all(outside.join("manifests")).unwrap();
+
+        let archiver = fixture.destination.join(".archiver");
+        symlink(&outside, &archiver).unwrap();
+
+        let result = discover_interrupted_journals(&fixture.destination);
+
+        assert_eq!(result.unwrap_err(), "Archive metadata folder is unsafe.");
+    }
+
     #[test]
     fn recovery_discovery_rejects_symlinked_manifests_folder() {
         use std::os::unix::fs::symlink;
