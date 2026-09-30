@@ -882,7 +882,13 @@ fn persist_journal(path: &Path, journal: &ArchiveJournal) -> Result<(), String> 
         .parent()
         .ok_or_else(|| "Could not determine journal folder.".to_string())?;
 
-    fs::create_dir_all(parent).map_err(|_| "Could not create the journal folder.".to_string())?;
+    let destination_root = path
+        .ancestors()
+        .nth(3)
+        .ok_or_else(|| "Could not determine archive destination.".to_string())?;
+
+    prepare_destination_parent(destination_root, parent)
+        .map_err(|_| "Journal folder is unsafe or could not be prepared.".to_string())?;
 
     let file_name = path
         .file_name()
@@ -1438,6 +1444,46 @@ mod tests {
         drop(guard);
 
         assert_eq!(with_archive_execution_lock(|| 42), Ok(42));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_rejects_symlinked_archiver_folder() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = TestFixture::new("journal-archiver-symlink");
+        let outside = fixture.root.join("outside");
+        fs::create_dir_all(&outside).unwrap();
+
+        symlink(&outside, fixture.destination.join(".archiver")).unwrap();
+
+        let file = fixture.create_source_file("report.txt", b"report", 2020);
+
+        let result = create_archive_journal(&fixture.destination, &fixture.source, &[file]);
+
+        assert!(result.is_err());
+        assert!(fs::read_dir(&outside).unwrap().next().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_rejects_symlinked_manifests_folder() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = TestFixture::new("journal-manifests-symlink");
+        let outside = fixture.root.join("outside");
+        fs::create_dir_all(&outside).unwrap();
+
+        let archiver = fixture.destination.join(".archiver");
+        fs::create_dir(&archiver).unwrap();
+        symlink(&outside, archiver.join("manifests")).unwrap();
+
+        let file = fixture.create_source_file("report.txt", b"report", 2020);
+
+        let result = create_archive_journal(&fixture.destination, &fixture.source, &[file]);
+
+        assert!(result.is_err());
+        assert!(fs::read_dir(&outside).unwrap().next().is_none());
     }
 
     #[test]
