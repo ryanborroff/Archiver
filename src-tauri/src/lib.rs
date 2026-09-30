@@ -1497,6 +1497,60 @@ fn execute_archive_operation(
     })
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RecoveryDiscoveryItem {
+    journal_path: String,
+    operation_id: String,
+    relative_path: Option<String>,
+    status: String,
+}
+
+fn recovery_status_label(verification: Option<&InterruptedFileVerification>) -> &'static str {
+    match verification {
+        Some(InterruptedFileVerification::SourceVerified) => "sourceVerified",
+        Some(InterruptedFileVerification::TemporaryVerified) => "temporaryVerified",
+        Some(InterruptedFileVerification::DestinationVerified) => "destinationVerified",
+        Some(InterruptedFileVerification::DestinationPlausible) => "destinationPlausible",
+        Some(InterruptedFileVerification::SourceChanged) => "sourceChanged",
+        Some(InterruptedFileVerification::TemporaryUnverified) => "temporaryUnverified",
+        Some(InterruptedFileVerification::DestinationUnverified) => "destinationUnverified",
+        Some(InterruptedFileVerification::Missing) => "missing",
+        Some(InterruptedFileVerification::Ambiguous) => "ambiguous",
+        None => "noActiveFile",
+    }
+}
+
+#[tauri::command]
+fn discover_archive_recovery(
+    archive_destination: String,
+) -> Result<Vec<RecoveryDiscoveryItem>, String> {
+    if archive_destination.trim().is_empty() {
+        return Err("Choose an archive destination.".to_string());
+    }
+
+    let destination = PathBuf::from(&archive_destination);
+
+    let metadata = fs::symlink_metadata(&destination)
+        .map_err(|_| "The archive destination is not available.".to_string())?;
+
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err("The archive destination is not a regular directory.".to_string());
+    }
+
+    let discoveries = discover_interrupted_journals(&destination)?;
+
+    Ok(discoveries
+        .into_iter()
+        .map(|discovery| RecoveryDiscoveryItem {
+            journal_path: discovery.journal_path.to_string_lossy().into_owned(),
+            operation_id: discovery.operation_id,
+            relative_path: discovery.relative_path,
+            status: recovery_status_label(discovery.verification.as_ref()).to_string(),
+        })
+        .collect())
+}
+
 #[tauri::command]
 fn execute_archive(
     source: String,
@@ -2557,6 +2611,75 @@ mod tests {
     }
 
     #[test]
+    fn recovery_status_labels_preserve_verification_strength() {
+        assert_eq!(
+            recovery_status_label(Some(&InterruptedFileVerification::SourceVerified)),
+            "sourceVerified"
+        );
+        assert_eq!(
+            recovery_status_label(Some(&InterruptedFileVerification::TemporaryVerified)),
+            "temporaryVerified"
+        );
+        assert_eq!(
+            recovery_status_label(Some(&InterruptedFileVerification::DestinationVerified)),
+            "destinationVerified"
+        );
+        assert_eq!(
+            recovery_status_label(Some(&InterruptedFileVerification::DestinationPlausible)),
+            "destinationPlausible"
+        );
+        assert_eq!(
+            recovery_status_label(Some(&InterruptedFileVerification::SourceChanged)),
+            "sourceChanged"
+        );
+        assert_eq!(
+            recovery_status_label(Some(&InterruptedFileVerification::TemporaryUnverified)),
+            "temporaryUnverified"
+        );
+        assert_eq!(
+            recovery_status_label(Some(&InterruptedFileVerification::DestinationUnverified)),
+            "destinationUnverified"
+        );
+        assert_eq!(
+            recovery_status_label(Some(&InterruptedFileVerification::Missing)),
+            "missing"
+        );
+        assert_eq!(
+            recovery_status_label(Some(&InterruptedFileVerification::Ambiguous)),
+            "ambiguous"
+        );
+        assert_eq!(recovery_status_label(None), "noActiveFile");
+    }
+
+    #[test]
+    fn recovery_command_reports_interrupted_archive_read_only() {
+        let fixture = TestFixture::new("recovery-command");
+        let file = fixture.create_source_file("Accounts/report.txt", b"report", 2020);
+
+        let (path, mut journal) = create_archive_journal(
+            &fixture.destination,
+            &fixture.source,
+            std::slice::from_ref(&file),
+        )
+        .unwrap();
+
+        set_journal_active_file(&path, &mut journal, &file).unwrap();
+
+        let response =
+            discover_archive_recovery(fixture.destination.to_string_lossy().into_owned()).unwrap();
+
+        assert_eq!(response.len(), 1);
+        assert_eq!(
+            response[0].relative_path.as_deref(),
+            Some("Accounts/report.txt")
+        );
+        assert_eq!(response[0].status, "sourceVerified");
+
+        assert!(fixture.source.join("Accounts/report.txt").exists());
+        assert!(path.exists());
+    }
+
+    #[test]
     fn execution_preflight_failure_archives_nothing() {
         let fixture = TestFixture::new("execution-preflight");
 
@@ -2674,6 +2797,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             scan_archive,
             plan_archive,
+            discover_archive_recovery,
             execute_archive
         ])
         .run(tauri::generate_context!())
