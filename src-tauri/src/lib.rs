@@ -1163,6 +1163,62 @@ fn read_archive_journal(path: &Path) -> Result<ArchiveJournal, String> {
     serde_json::from_slice(&bytes).map_err(|_| "Archive journal is not valid JSON.".to_string())
 }
 
+#[derive(Debug, PartialEq)]
+struct InterruptedJournalInspection {
+    relative_path: String,
+    verification: InterruptedFileVerification,
+}
+
+fn inspect_interrupted_journal(
+    path: &Path,
+) -> Result<Option<InterruptedJournalInspection>, String> {
+    let journal = read_archive_journal(path)?;
+
+    if journal.version != 4 {
+        return Err(format!(
+            "Archive journal version {} cannot be inspected automatically.",
+            journal.version
+        ));
+    }
+
+    if journal.state == JournalState::Completed {
+        return Ok(None);
+    }
+
+    let Some(active) = journal.active_file else {
+        return Ok(None);
+    };
+
+    let source_root = PathBuf::from(&journal.source_root);
+    let destination_root = PathBuf::from(&journal.destination_root);
+
+    let (source_root, destination_root) =
+        validate_execution_roots(&source_root, &destination_root)?;
+
+    let relative_path = active.relative_path.clone();
+    let name = Path::new(&relative_path)
+        .file_name()
+        .ok_or_else(|| "Interrupted archive file has an invalid path.".to_string())?
+        .to_string_lossy()
+        .into_owned();
+
+    let file = ArchiveFile {
+        name,
+        relative_path: active.relative_path,
+        size: active.size,
+        modified_ms: active.modified_ms,
+        year: active.year,
+    };
+
+    let verification = verify_interrupted_file(&source_root, &destination_root, &file)
+        .map_err(|error| failure_message(&error).to_string())?;
+
+    Ok(Some(InterruptedJournalInspection {
+        relative_path,
+        verification,
+    }))
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ArchiveExecutionResponse {
@@ -2286,6 +2342,76 @@ mod tests {
             Some("unfinished.txt")
         );
         assert_eq!(recovered.result.archived_files, 0);
+    }
+
+    #[test]
+    fn interrupted_journal_inspection_verifies_active_source() {
+        let fixture = TestFixture::new("inspect-journal-source");
+        let file = fixture.create_source_file("Accounts/report.txt", b"report", 2020);
+
+        let (path, mut journal) = create_archive_journal(
+            &fixture.destination,
+            &fixture.source,
+            std::slice::from_ref(&file),
+        )
+        .unwrap();
+
+        set_journal_active_file(&path, &mut journal, &file).unwrap();
+
+        let inspection = inspect_interrupted_journal(&path)
+            .unwrap()
+            .expect("in-progress active file should be inspected");
+
+        assert_eq!(inspection.relative_path, "Accounts/report.txt");
+        assert_eq!(
+            inspection.verification,
+            InterruptedFileVerification::SourceVerified
+        );
+    }
+
+    #[test]
+    fn interrupted_journal_inspection_detects_corrupt_destination() {
+        let fixture = TestFixture::new("inspect-journal-corrupt-destination");
+        let file = fixture.create_source_file("report.txt", b"report", 2020);
+
+        let destination = destination_for_file(&fixture.destination, &file).unwrap();
+        fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        fs::write(&destination, b"xxxxxx").unwrap();
+
+        let (path, mut journal) = create_archive_journal(
+            &fixture.destination,
+            &fixture.source,
+            std::slice::from_ref(&file),
+        )
+        .unwrap();
+
+        set_journal_active_file(&path, &mut journal, &file).unwrap();
+
+        let inspection = inspect_interrupted_journal(&path)
+            .unwrap()
+            .expect("in-progress active file should be inspected");
+
+        assert_eq!(
+            inspection.verification,
+            InterruptedFileVerification::DestinationUnverified
+        );
+    }
+
+    #[test]
+    fn completed_journal_needs_no_interrupted_file_inspection() {
+        let fixture = TestFixture::new("inspect-completed-journal");
+        let file = fixture.create_source_file("report.txt", b"report", 2020);
+
+        let (path, mut journal) = create_archive_journal(
+            &fixture.destination,
+            &fixture.source,
+            std::slice::from_ref(&file),
+        )
+        .unwrap();
+
+        complete_archive_journal(&path, &mut journal).unwrap();
+
+        assert_eq!(inspect_interrupted_journal(&path).unwrap(), None);
     }
 
     #[test]
