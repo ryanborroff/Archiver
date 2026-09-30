@@ -159,7 +159,10 @@ function App() {
   }
 
   async function reviewArchive() {
-    if (!result || !source || !destination) return;
+    if (!result || !source || !destination) {
+      setError("Cannot review archive: scan data or folder selection is missing.");
+      return;
+    }
 
     setPlanning(true);
     setError("");
@@ -176,7 +179,7 @@ function App() {
       setPlan(archivePlan);
     } catch (reason) {
       setPlan(null);
-      setError(String(reason));
+      setError(`Could not review archive: ${String(reason)}`);
     } finally {
       setPlanning(false);
     }
