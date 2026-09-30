@@ -136,6 +136,7 @@ function App() {
     useState<ArchiveExecutionResponse | null>(null);
   const [recoveryItems, setRecoveryItems] = useState<RecoveryDiscoveryItem[]>([]);
   const [checkingRecovery, setCheckingRecovery] = useState(false);
+  const [recoveringOperation, setRecoveringOperation] = useState<string | null>(null);
 
   const cutoff = Number(cutoffYear);
   const canScan =
@@ -192,6 +193,40 @@ function App() {
       } finally {
         setCheckingRecovery(false);
       }
+    }
+  }
+
+  async function recoverArchive(item: RecoveryDiscoveryItem) {
+    if (!destination || item.status !== "sourceVerified") return;
+
+    setRecoveringOperation(item.operationId);
+    setError("");
+
+    try {
+      const response = await invoke<ArchiveExecutionResponse>("recover_archive", {
+        archiveDestination: destination,
+        operationId: item.operationId,
+      });
+
+      setExecution(response);
+
+      const recovery = await invoke<RecoveryDiscoveryItem[]>(
+        "discover_archive_recovery",
+        {
+          archiveDestination: destination,
+        },
+      );
+
+      setRecoveryItems(recovery);
+      setResult(null);
+      setPlan(null);
+      setConfirmingArchive(false);
+      setShowFiles(false);
+      setSelectedYear(null);
+    } catch (reason) {
+      setError(`Recovery did not complete: ${String(reason)}`);
+    } finally {
+      setRecoveringOperation(null);
     }
   }
 
@@ -374,6 +409,18 @@ function App() {
                     <span className="recovery-path">{item.relativePath}</span>
                   )}
                   <span>{recoveryMessage(item.status)}</span>
+
+                  {item.status === "sourceVerified" && (
+                    <button
+                      className="recovery-button"
+                      disabled={recoveringOperation !== null || archiving}
+                      onClick={() => recoverArchive(item)}
+                    >
+                      {recoveringOperation === item.operationId
+                        ? "Resuming…"
+                        : "Resume archive"}
+                    </button>
+                  )}
                 </div>
               ))}
 

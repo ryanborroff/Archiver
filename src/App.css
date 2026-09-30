@@ -546,3 +546,35 @@ button.year-row.selected {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   overflow-wrap: anywhere;
 }
+
+.recovery-button {
+  align-self: flex-start;
+  margin-top: 8px;
+  padding: 7px 11px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: transparent;
+  font: inherit;
+  cursor: pointer;
+}
+
+.recovery-button:disabled {
+  cursor: default;
+  opacity: 0.5;
+}
+
+.recovery-button {
+  margin-left: 0;
+}
+
+/* Recovery actions align with the surrounding recovery copy. */
+.recovery-button {
+  margin: 8px 0 0;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  font: inherit;
+  font-weight: 600;
+  text-align: left;
+}

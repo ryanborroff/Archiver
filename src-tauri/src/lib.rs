@@ -1233,6 +1233,86 @@ fn inspect_interrupted_journal(
     }))
 }
 
+fn recover_source_verified_journal(path: &Path) -> Result<ArchiveExecutionResponse, String> {
+    let mut journal = read_archive_journal(path)?;
+
+    if journal.version != 4 {
+        return Err("Only version 4 archive journals can be recovered automatically.".to_string());
+    }
+
+    if journal.state == JournalState::Completed {
+        return Err("This archive operation is already complete.".to_string());
+    }
+
+    let active = journal
+        .active_file
+        .clone()
+        .ok_or_else(|| "The interrupted archive has no active file to recover.".to_string())?;
+
+    let source_root = PathBuf::from(&journal.source_root);
+    let destination_root = PathBuf::from(&journal.destination_root);
+
+    let (source_root, destination_root) =
+        validate_execution_roots(&source_root, &destination_root)?;
+
+    let name = Path::new(&active.relative_path)
+        .file_name()
+        .ok_or_else(|| "Interrupted archive file has an invalid path.".to_string())?
+        .to_string_lossy()
+        .into_owned();
+
+    let file = ArchiveFile {
+        name,
+        relative_path: active.relative_path,
+        size: active.size,
+        modified_ms: active.modified_ms,
+        year: active.year,
+    };
+
+    let verification = verify_interrupted_file(&source_root, &destination_root, &file)
+        .map_err(|error| failure_message(&error).to_string())?;
+
+    if verification != InterruptedFileVerification::SourceVerified {
+        return Err(
+            "Automatic recovery is only available when the original file is verified and untouched."
+                .to_string(),
+        );
+    }
+
+    let destination_path = destination_for_file(&destination_root, &file)
+        .map_err(|error| failure_message(&error).to_string())?;
+
+    let transfer = execute_file_transfer(&source_root, &destination_root, &file);
+
+    let item = match transfer {
+        Ok(()) => ExecutionItem {
+            relative_path: file.relative_path.clone(),
+            destination: destination_path.to_string_lossy().into_owned(),
+            status: ExecutionStatus::Archived,
+            detail: None,
+        },
+        Err(TransferFailure::SourceDeleteFailed) => ExecutionItem {
+            relative_path: file.relative_path.clone(),
+            destination: destination_path.to_string_lossy().into_owned(),
+            status: ExecutionStatus::SourceRetained,
+            detail: Some(failure_message(&TransferFailure::SourceDeleteFailed).to_string()),
+        },
+        Err(error) => {
+            // Leave active_file intact. The journal continues to describe an
+            // interrupted operation and can be inspected again safely.
+            return Err(format!("Recovery stopped: {}", failure_message(&error)));
+        }
+    };
+
+    append_journal_result(path, &mut journal, item, file.size)?;
+    complete_archive_journal(path, &mut journal)?;
+
+    Ok(ArchiveExecutionResponse {
+        result: journal.result,
+        journal_path: path.to_string_lossy().into_owned(),
+    })
+}
+
 #[derive(Debug, PartialEq)]
 struct InterruptedJournalDiscovery {
     journal_path: PathBuf,
@@ -1585,6 +1665,52 @@ fn discover_archive_recovery(
             status: recovery_status_label(discovery.verification.as_ref()).to_string(),
         })
         .collect())
+}
+
+#[tauri::command]
+fn recover_archive(
+    archive_destination: String,
+    operation_id: String,
+) -> Result<ArchiveExecutionResponse, String> {
+    if archive_destination.trim().is_empty() {
+        return Err("Choose an archive destination.".to_string());
+    }
+
+    if operation_id.is_empty()
+        || !operation_id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '-')
+    {
+        return Err("Invalid archive operation identifier.".to_string());
+    }
+
+    let supplied_destination = PathBuf::from(&archive_destination);
+
+    let metadata = fs::symlink_metadata(&supplied_destination)
+        .map_err(|_| "The archive destination is not available.".to_string())?;
+
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err("The archive destination is not a regular directory.".to_string());
+    }
+
+    let destination = fs::canonicalize(&supplied_destination)
+        .map_err(|_| "The archive destination is not available.".to_string())?;
+
+    let path = journal_path(&destination, &operation_id);
+    let journal = read_archive_journal(&path)?;
+
+    let recorded_destination = PathBuf::from(&journal.destination_root);
+
+    let recorded_destination = fs::canonicalize(&recorded_destination)
+        .map_err(|_| "The archive journal destination is not available.".to_string())?;
+
+    if recorded_destination != destination {
+        return Err(
+            "This archive journal does not belong to the selected destination.".to_string(),
+        );
+    }
+
+    with_archive_execution_lock(|| recover_source_verified_journal(&path))?
 }
 
 #[tauri::command]
@@ -2573,6 +2699,179 @@ mod tests {
     }
 
     #[test]
+    fn source_verified_recovery_archives_file_and_completes_journal() {
+        let fixture = TestFixture::new("recover-source-verified");
+        let file = fixture.create_source_file("Accounts/report.txt", b"report", 2020);
+
+        let (path, mut journal) = create_archive_journal(
+            &fixture.destination,
+            &fixture.source,
+            std::slice::from_ref(&file),
+        )
+        .unwrap();
+
+        set_journal_active_file(&path, &mut journal, &file).unwrap();
+
+        let response = recover_source_verified_journal(&path).unwrap();
+
+        assert_eq!(response.result.archived_files, 1);
+        assert_eq!(response.result.failed_files, 0);
+        assert!(!fixture.source.join("Accounts/report.txt").exists());
+        assert_eq!(
+            fs::read(fixture.destination.join("2020/Accounts/report.txt")).unwrap(),
+            b"report"
+        );
+
+        let recovered = read_archive_journal(&path).unwrap();
+        assert_eq!(recovered.state, JournalState::Completed);
+        assert!(recovered.active_file.is_none());
+        assert_eq!(recovered.result.archived_files, 1);
+    }
+
+    #[test]
+    fn source_verified_recovery_refuses_changed_source() {
+        let fixture = TestFixture::new("recover-changed-source");
+        let file = fixture.create_source_file("Accounts/report.txt", b"report", 2020);
+
+        let (path, mut journal) = create_archive_journal(
+            &fixture.destination,
+            &fixture.source,
+            std::slice::from_ref(&file),
+        )
+        .unwrap();
+
+        set_journal_active_file(&path, &mut journal, &file).unwrap();
+
+        fs::write(
+            fixture.source.join("Accounts/report.txt"),
+            b"changed contents",
+        )
+        .unwrap();
+
+        let result = recover_source_verified_journal(&path);
+
+        assert!(result.is_err());
+        assert!(fixture.source.join("Accounts/report.txt").exists());
+        assert!(!fixture
+            .destination
+            .join("2020/Accounts/report.txt")
+            .exists());
+
+        let unchanged = read_archive_journal(&path).unwrap();
+        assert_eq!(unchanged.state, JournalState::InProgress);
+        assert!(unchanged.active_file.is_some());
+    }
+
+    #[test]
+    fn source_verified_recovery_refuses_existing_destination() {
+        let fixture = TestFixture::new("recover-existing-destination");
+        let file = fixture.create_source_file("Accounts/report.txt", b"report", 2020);
+
+        let (path, mut journal) = create_archive_journal(
+            &fixture.destination,
+            &fixture.source,
+            std::slice::from_ref(&file),
+        )
+        .unwrap();
+
+        set_journal_active_file(&path, &mut journal, &file).unwrap();
+
+        let destination = fixture.destination.join("2020/Accounts/report.txt");
+        fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        fs::write(&destination, b"different").unwrap();
+
+        let result = recover_source_verified_journal(&path);
+
+        assert!(result.is_err());
+        assert!(fixture.source.join("Accounts/report.txt").exists());
+        assert_eq!(fs::read(&destination).unwrap(), b"different");
+
+        let unchanged = read_archive_journal(&path).unwrap();
+        assert_eq!(unchanged.state, JournalState::InProgress);
+        assert!(unchanged.active_file.is_some());
+    }
+
+    #[test]
+    fn recover_archive_command_recovers_matching_operation() {
+        let fixture = TestFixture::new("recover-command-valid");
+        let file = fixture.create_source_file("Accounts/report.txt", b"report", 2020);
+
+        let (_path, mut journal) = create_archive_journal(
+            &fixture.destination,
+            &fixture.source,
+            std::slice::from_ref(&file),
+        )
+        .unwrap();
+
+        let operation_id = journal.operation_id.clone();
+        let path = journal_path(&fixture.destination, &operation_id);
+
+        set_journal_active_file(&path, &mut journal, &file).unwrap();
+
+        let response = recover_archive(
+            fixture.destination.to_string_lossy().into_owned(),
+            operation_id,
+        )
+        .unwrap();
+
+        assert_eq!(response.result.archived_files, 1);
+        assert!(!fixture.source.join("Accounts/report.txt").exists());
+        assert!(fixture
+            .destination
+            .join("2020/Accounts/report.txt")
+            .exists());
+    }
+
+    #[test]
+    fn recover_archive_command_rejects_path_like_operation_id() {
+        let fixture = TestFixture::new("recover-command-path-id");
+
+        let result = recover_archive(
+            fixture.destination.to_string_lossy().into_owned(),
+            "../outside".to_string(),
+        );
+
+        assert_eq!(result.unwrap_err(), "Invalid archive operation identifier.");
+    }
+
+    #[test]
+    fn recover_archive_command_rejects_journal_for_other_destination() {
+        let fixture = TestFixture::new("recover-command-wrong-destination");
+        let other_destination = fixture.root.join("other-destination");
+        fs::create_dir_all(&other_destination).unwrap();
+
+        let file = fixture.create_source_file("Accounts/report.txt", b"report", 2020);
+
+        let (path, mut journal) = create_archive_journal(
+            &fixture.destination,
+            &fixture.source,
+            std::slice::from_ref(&file),
+        )
+        .unwrap();
+
+        set_journal_active_file(&path, &mut journal, &file).unwrap();
+
+        journal.destination_root = other_destination.to_string_lossy().into_owned();
+        persist_journal(&path, &journal).unwrap();
+
+        let result = recover_archive(
+            fixture.destination.to_string_lossy().into_owned(),
+            journal.operation_id.clone(),
+        );
+
+        assert_eq!(
+            result.unwrap_err(),
+            "This archive journal does not belong to the selected destination."
+        );
+
+        assert!(fixture.source.join("Accounts/report.txt").exists());
+        assert!(!fixture
+            .destination
+            .join("2020/Accounts/report.txt")
+            .exists());
+    }
+
+    #[test]
     fn recovery_discovery_returns_empty_when_no_manifests_exist() {
         let fixture = TestFixture::new("discover-no-manifests");
 
@@ -2892,6 +3191,7 @@ pub fn run() {
             scan_archive,
             plan_archive,
             discover_archive_recovery,
+            recover_archive,
             execute_archive
         ])
         .run(tauri::generate_context!())
