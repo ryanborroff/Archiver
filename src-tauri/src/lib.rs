@@ -656,7 +656,7 @@ enum ExecutionStatus {
     Failed,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ExecutionItem {
     relative_path: String,
@@ -665,7 +665,7 @@ struct ExecutionItem {
     detail: Option<String>,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ExecutionResult {
     items: Vec<ExecutionItem>,
@@ -933,6 +933,210 @@ fn read_archive_journal(path: &Path) -> Result<ArchiveJournal, String> {
     let bytes = fs::read(path).map_err(|_| "Could not read archive journal.".to_string())?;
 
     serde_json::from_slice(&bytes).map_err(|_| "Archive journal is not valid JSON.".to_string())
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ArchiveExecutionResponse {
+    result: ExecutionResult,
+    journal_path: String,
+}
+
+fn validate_execution_roots(
+    source: &Path,
+    destination: &Path,
+) -> Result<(PathBuf, PathBuf), String> {
+    let source_root = fs::canonicalize(source)
+        .map_err(|_| "The source folder is no longer available.".to_string())?;
+
+    let destination_root = fs::canonicalize(destination)
+        .map_err(|_| "The archive destination is no longer available.".to_string())?;
+
+    let source_metadata = fs::symlink_metadata(&source_root)
+        .map_err(|_| "The source folder is no longer available.".to_string())?;
+
+    let destination_metadata = fs::symlink_metadata(&destination_root)
+        .map_err(|_| "The archive destination is no longer available.".to_string())?;
+
+    if source_metadata.file_type().is_symlink() || !source_metadata.is_dir() {
+        return Err("The source folder is not a regular directory.".to_string());
+    }
+
+    if destination_metadata.file_type().is_symlink() || !destination_metadata.is_dir() {
+        return Err("The archive destination is not a regular directory.".to_string());
+    }
+
+    if source_root == destination_root {
+        return Err("The archive destination cannot be the source folder.".to_string());
+    }
+
+    if source_root.starts_with(&destination_root) {
+        return Err("The source folder cannot be inside the archive destination.".to_string());
+    }
+
+    Ok((source_root, destination_root))
+}
+
+fn preflight_archive_execution(
+    source_root: &Path,
+    destination_root: &Path,
+    files: &[ArchiveFile],
+) -> Result<(), String> {
+    if files.is_empty() {
+        return Err("There are no files ready to archive.".to_string());
+    }
+
+    for file in files {
+        let relative_path = safe_relative_path(&file.relative_path)
+            .map_err(|_| "The archive plan contains an unsafe file path.".to_string())?;
+
+        let source_path = source_root.join(&relative_path);
+
+        verify_source(&source_path, file.size, file.modified_ms)
+            .map_err(|error| failure_message(&error).to_string())?;
+
+        let destination_path = destination_root
+            .join(file.year.to_string())
+            .join(&relative_path);
+
+        // symlink_metadata catches dangling symlinks as conflicts too.
+        if fs::symlink_metadata(&destination_path).is_ok() {
+            return Err(format!(
+                "Archive destination already exists for {}.",
+                file.relative_path
+            ));
+        }
+
+        let parent = destination_path
+            .parent()
+            .ok_or_else(|| "The archive destination path is invalid.".to_string())?;
+
+        // Validate existing destination components without creating anything.
+        if !parent.starts_with(destination_root) {
+            return Err("The archive destination path is unsafe.".to_string());
+        }
+
+        let relative_parent = parent
+            .strip_prefix(destination_root)
+            .map_err(|_| "The archive destination path is unsafe.".to_string())?;
+
+        let mut current = destination_root.to_path_buf();
+
+        for component in relative_parent.components() {
+            let Component::Normal(component) = component else {
+                return Err("The archive destination path is unsafe.".to_string());
+            };
+
+            current.push(component);
+
+            match fs::symlink_metadata(&current) {
+                Ok(metadata) => {
+                    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                        return Err(format!(
+                            "Archive destination is blocked for {}.",
+                            file.relative_path
+                        ));
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    // Missing directories are fine. They will be created only
+                    // after the entire batch passes preflight.
+                    break;
+                }
+                Err(_) => {
+                    return Err(format!(
+                        "Archive destination could not be checked for {}.",
+                        file.relative_path
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn execute_archive_operation(
+    source: &Path,
+    destination: &Path,
+    files: &[ArchiveFile],
+) -> Result<ArchiveExecutionResponse, String> {
+    let (source_root, destination_root) = validate_execution_roots(source, destination)?;
+
+    // Critical rule: nothing is moved until every supplied file passes.
+    preflight_archive_execution(&source_root, &destination_root, files)?;
+
+    let (journal_path, mut journal) =
+        create_archive_journal(&destination_root, &source_root, files)?;
+
+    for file in files {
+        let destination_path = destination_for_file(&destination_root, file)
+            .map_err(|error| failure_message(&error).to_string())?;
+
+        let destination_string = destination_path.to_string_lossy().into_owned();
+
+        let item = match execute_file_transfer(&source_root, &destination_root, file) {
+            Ok(()) => ExecutionItem {
+                relative_path: file.relative_path.clone(),
+                destination: destination_string,
+                status: ExecutionStatus::Archived,
+                detail: None,
+            },
+            Err(TransferFailure::SourceDeleteFailed) => ExecutionItem {
+                relative_path: file.relative_path.clone(),
+                destination: destination_string,
+                status: ExecutionStatus::SourceRetained,
+                detail: Some(failure_message(&TransferFailure::SourceDeleteFailed).to_string()),
+            },
+            Err(error) => {
+                let detail = failure_message(&error).to_string();
+
+                let item = ExecutionItem {
+                    relative_path: file.relative_path.clone(),
+                    destination: destination_string,
+                    status: ExecutionStatus::Failed,
+                    detail: Some(detail.clone()),
+                };
+
+                // Persist the failure before returning. The journal deliberately
+                // remains InProgress so interrupted/partial work is visible.
+                append_journal_result(&journal_path, &mut journal, item, file.size)?;
+
+                return Err(format!(
+                    "Archiving stopped at {}: {}",
+                    file.relative_path, detail
+                ));
+            }
+        };
+
+        append_journal_result(&journal_path, &mut journal, item, file.size)?;
+    }
+
+    complete_archive_journal(&journal_path, &mut journal)?;
+
+    Ok(ArchiveExecutionResponse {
+        result: journal.result,
+        journal_path: journal_path.to_string_lossy().into_owned(),
+    })
+}
+
+#[tauri::command]
+fn execute_archive(
+    source: String,
+    archive_destination: String,
+    files: Vec<ArchiveFile>,
+) -> Result<ArchiveExecutionResponse, String> {
+    if source.trim().is_empty() {
+        return Err("Choose a source folder.".to_string());
+    }
+
+    if archive_destination.trim().is_empty() {
+        return Err("Choose an archive destination.".to_string());
+    }
+
+    with_archive_execution_lock(|| {
+        execute_archive_operation(Path::new(&source), Path::new(&archive_destination), &files)
+    })?
 }
 
 fn with_archive_execution_lock<T>(operation: impl FnOnce() -> T) -> Result<T, String> {
@@ -1365,6 +1569,76 @@ mod tests {
     }
 
     #[test]
+    fn execution_preflight_failure_archives_nothing() {
+        let fixture = TestFixture::new("execution-preflight");
+
+        let first = fixture.create_source_file("first.txt", b"first", 2020);
+        let second = fixture.create_source_file("second.txt", b"second", 2020);
+
+        fs::create_dir_all(fixture.destination.join("2020")).unwrap();
+        fs::write(fixture.destination.join("2020/second.txt"), b"existing").unwrap();
+
+        let result =
+            execute_archive_operation(&fixture.source, &fixture.destination, &[first, second]);
+
+        assert!(result.is_err());
+        assert!(fixture.source.join("first.txt").exists());
+        assert!(fixture.source.join("second.txt").exists());
+        assert!(!fixture.destination.join("2020/first.txt").exists());
+        assert_eq!(
+            fs::read(fixture.destination.join("2020/second.txt")).unwrap(),
+            b"existing"
+        );
+    }
+
+    #[test]
+    fn execution_archives_batch_and_completes_journal() {
+        let fixture = TestFixture::new("execution-complete");
+
+        let first = fixture.create_source_file("Accounts/first.txt", b"first", 2020);
+        let second = fixture.create_source_file("second.txt", b"second", 2021);
+
+        let response =
+            execute_archive_operation(&fixture.source, &fixture.destination, &[first, second])
+                .unwrap();
+
+        assert_eq!(response.result.archived_files, 2);
+        assert_eq!(response.result.failed_files, 0);
+        assert_eq!(response.result.source_retained_files, 0);
+
+        assert!(!fixture.source.join("Accounts/first.txt").exists());
+        assert!(!fixture.source.join("second.txt").exists());
+
+        assert_eq!(
+            fs::read(fixture.destination.join("2020/Accounts/first.txt")).unwrap(),
+            b"first"
+        );
+
+        assert_eq!(
+            fs::read(fixture.destination.join("2021/second.txt")).unwrap(),
+            b"second"
+        );
+
+        let journal = read_archive_journal(Path::new(&response.journal_path)).unwrap();
+
+        assert_eq!(journal.state, JournalState::Completed);
+        assert_eq!(journal.result.archived_files, 2);
+        assert_eq!(journal.result.items.len(), 2);
+    }
+
+    #[test]
+    fn execution_rejects_empty_batch() {
+        let fixture = TestFixture::new("execution-empty");
+
+        let result = execute_archive_operation(&fixture.source, &fixture.destination, &[]);
+
+        assert!(result.is_err());
+
+        let manifests = fixture.destination.join(".archiver/manifests");
+        assert!(!manifests.exists());
+    }
+
+    #[test]
     fn year_conversion_handles_known_dates() {
         let jan_2020 = UNIX_EPOCH + Duration::from_secs(1_577_836_800);
         let dec_2021 = UNIX_EPOCH + Duration::from_secs(1_640_908_799);
@@ -1379,7 +1653,11 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![scan_archive, plan_archive])
+        .invoke_handler(tauri::generate_handler![
+            scan_archive,
+            plan_archive,
+            execute_archive
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
