@@ -684,14 +684,36 @@ fn execute_archive_batch(
     }
 }
 
+#[derive(Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+enum JournalState {
+    InProgress,
+    Completed,
+}
+
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ArchiveManifest {
+struct ArchiveJournal {
     version: u32,
+    operation_id: String,
     created_ms: u64,
+    updated_ms: u64,
+    state: JournalState,
     source_root: String,
     destination_root: String,
+    planned_files: usize,
+    planned_size: u64,
     result: ExecutionResult,
+}
+
+fn empty_execution_result() -> ExecutionResult {
+    ExecutionResult {
+        items: Vec::new(),
+        archived_files: 0,
+        archived_size: 0,
+        source_retained_files: 0,
+        failed_files: 0,
+    }
 }
 
 fn current_time_ms() -> Result<u64, String> {
@@ -701,78 +723,51 @@ fn current_time_ms() -> Result<u64, String> {
         .map_err(|_| "System clock is before the Unix epoch.".to_string())
 }
 
-fn manifest_path(destination_root: &Path, created_ms: u64) -> PathBuf {
+fn journal_path(destination_root: &Path, operation_id: &str) -> PathBuf {
     destination_root
         .join(".archiver")
         .join("manifests")
-        .join(format!("archive-{created_ms}.json"))
+        .join(format!("archive-{operation_id}.json"))
 }
 
-fn write_manifest(
-    destination_root: &Path,
-    source_root: &Path,
-    result: &ExecutionResult,
-) -> Result<PathBuf, String> {
-    let created_ms = current_time_ms()?;
-    let final_path = manifest_path(destination_root, created_ms);
-
-    let parent = final_path
+fn persist_journal(path: &Path, journal: &ArchiveJournal) -> Result<(), String> {
+    let parent = path
         .parent()
-        .ok_or_else(|| "Could not determine manifest folder.".to_string())?;
+        .ok_or_else(|| "Could not determine journal folder.".to_string())?;
 
-    fs::create_dir_all(parent).map_err(|_| "Could not create the manifest folder.".to_string())?;
+    fs::create_dir_all(parent).map_err(|_| "Could not create the journal folder.".to_string())?;
 
-    let temp_path = final_path.with_extension("json.archiver-part");
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| "Could not determine journal filename.".to_string())?
+        .to_string_lossy();
 
-    if final_path.exists() || temp_path.exists() {
-        return Err("A manifest with this identifier already exists.".to_string());
+    let temp_path = path.with_file_name(format!(".{file_name}.archiver-part"));
+
+    // We only ever replace our own journal temp file. An unexpected one is
+    // treated as evidence of an interrupted or concurrent write.
+    if temp_path.exists() {
+        return Err("An unfinished journal update already exists.".to_string());
     }
 
-    let manifest = ArchiveManifest {
-        version: 1,
-        created_ms,
-        source_root: source_root.to_string_lossy().into_owned(),
-        destination_root: destination_root.to_string_lossy().into_owned(),
-        result: ExecutionResult {
-            items: result
-                .items
-                .iter()
-                .map(|item| ExecutionItem {
-                    relative_path: item.relative_path.clone(),
-                    destination: item.destination.clone(),
-                    status: match item.status {
-                        ExecutionStatus::Archived => ExecutionStatus::Archived,
-                        ExecutionStatus::SourceRetained => ExecutionStatus::SourceRetained,
-                        ExecutionStatus::Failed => ExecutionStatus::Failed,
-                    },
-                    detail: item.detail.clone(),
-                })
-                .collect(),
-            archived_files: result.archived_files,
-            archived_size: result.archived_size,
-            source_retained_files: result.source_retained_files,
-            failed_files: result.failed_files,
-        },
-    };
-
-    let bytes = serde_json::to_vec_pretty(&manifest)
-        .map_err(|_| "Could not serialize archive manifest.".to_string())?;
+    let bytes = serde_json::to_vec_pretty(journal)
+        .map_err(|_| "Could not serialize archive journal.".to_string())?;
 
     let write_result = (|| -> Result<(), String> {
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&temp_path)
-            .map_err(|_| "Could not create temporary manifest.".to_string())?;
+            .map_err(|_| "Could not create temporary journal.".to_string())?;
 
         file.write_all(&bytes)
-            .map_err(|_| "Could not write archive manifest.".to_string())?;
+            .map_err(|_| "Could not write archive journal.".to_string())?;
 
         file.flush()
-            .map_err(|_| "Could not flush archive manifest.".to_string())?;
+            .map_err(|_| "Could not flush archive journal.".to_string())?;
 
         file.sync_all()
-            .map_err(|_| "Could not sync archive manifest.".to_string())?;
+            .map_err(|_| "Could not sync archive journal.".to_string())?;
 
         Ok(())
     })();
@@ -782,10 +777,83 @@ fn write_manifest(
         return Err(error);
     }
 
-    fs::rename(&temp_path, &final_path)
-        .map_err(|_| "Could not finalise archive manifest.".to_string())?;
+    // On our macOS target, rename replaces the existing journal atomically.
+    fs::rename(&temp_path, path).map_err(|_| "Could not finalise archive journal.".to_string())?;
 
-    Ok(final_path)
+    Ok(())
+}
+
+fn create_archive_journal(
+    destination_root: &Path,
+    source_root: &Path,
+    files: &[ArchiveFile],
+) -> Result<(PathBuf, ArchiveJournal), String> {
+    let created_ms = current_time_ms()?;
+
+    // Timestamp plus process ID keeps operation names readable while avoiding
+    // collisions between separate Archiver processes started in the same ms.
+    let operation_id = format!("{created_ms}-{}", std::process::id());
+
+    let path = journal_path(destination_root, &operation_id);
+
+    if path.exists() {
+        return Err("An archive journal with this identifier already exists.".to_string());
+    }
+
+    let journal = ArchiveJournal {
+        version: 2,
+        operation_id,
+        created_ms,
+        updated_ms: created_ms,
+        state: JournalState::InProgress,
+        source_root: source_root.to_string_lossy().into_owned(),
+        destination_root: destination_root.to_string_lossy().into_owned(),
+        planned_files: files.len(),
+        planned_size: files.iter().map(|file| file.size).sum(),
+        result: empty_execution_result(),
+    };
+
+    persist_journal(&path, &journal)?;
+
+    Ok((path, journal))
+}
+
+fn append_journal_result(
+    path: &Path,
+    journal: &mut ArchiveJournal,
+    item: ExecutionItem,
+    file_size: u64,
+) -> Result<(), String> {
+    match item.status {
+        ExecutionStatus::Archived => {
+            journal.result.archived_files += 1;
+            journal.result.archived_size += file_size;
+        }
+        ExecutionStatus::SourceRetained => {
+            journal.result.source_retained_files += 1;
+        }
+        ExecutionStatus::Failed => {
+            journal.result.failed_files += 1;
+        }
+    }
+
+    journal.result.items.push(item);
+    journal.updated_ms = current_time_ms()?;
+
+    persist_journal(path, journal)
+}
+
+fn complete_archive_journal(path: &Path, journal: &mut ArchiveJournal) -> Result<(), String> {
+    journal.state = JournalState::Completed;
+    journal.updated_ms = current_time_ms()?;
+
+    persist_journal(path, journal)
+}
+
+fn read_archive_journal(path: &Path) -> Result<ArchiveJournal, String> {
+    let bytes = fs::read(path).map_err(|_| "Could not read archive journal.".to_string())?;
+
+    serde_json::from_slice(&bytes).map_err(|_| "Archive journal is not valid JSON.".to_string())
 }
 
 fn with_archive_execution_lock<T>(operation: impl FnOnce() -> T) -> Result<T, String> {
@@ -941,29 +1009,106 @@ mod tests {
     }
 
     #[test]
-    fn manifest_records_completed_batch() {
-        let fixture = TestFixture::new("manifest");
+    fn journal_exists_before_any_transfer() {
+        let fixture = TestFixture::new("journal-before-transfer");
+
         let file = fixture.create_source_file("Accounts/report.txt", b"report", 2020);
 
-        let result = execute_archive_batch(&fixture.source, &fixture.destination, &[file]);
+        let (path, journal) =
+            create_archive_journal(&fixture.destination, &fixture.source, &[file]).unwrap();
 
-        let manifest_path = write_manifest(&fixture.destination, &fixture.source, &result).unwrap();
+        assert!(path.exists());
+        assert_eq!(journal.version, 2);
+        assert_eq!(journal.state, JournalState::InProgress);
+        assert_eq!(journal.planned_files, 1);
+        assert_eq!(journal.planned_size, 6);
+        assert_eq!(journal.result.items.len(), 0);
 
-        assert!(manifest_path.exists());
+        let stored = read_archive_journal(&path).unwrap();
 
-        let bytes = fs::read(&manifest_path).unwrap();
-        let manifest: ArchiveManifest = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(stored.state, JournalState::InProgress);
+        assert_eq!(stored.result.archived_files, 0);
+        assert_eq!(stored.result.failed_files, 0);
+    }
 
-        assert_eq!(manifest.version, 1);
-        assert_eq!(manifest.result.archived_files, 1);
-        assert_eq!(manifest.result.failed_files, 0);
-        assert_eq!(manifest.result.source_retained_files, 0);
-        assert_eq!(manifest.result.items.len(), 1);
+    #[test]
+    fn journal_persists_each_completed_file() {
+        let fixture = TestFixture::new("journal-progress");
+
+        let file = fixture.create_source_file("Accounts/report.txt", b"report", 2020);
+
+        let (path, mut journal) = create_archive_journal(
+            &fixture.destination,
+            &fixture.source,
+            std::slice::from_ref(&file),
+        )
+        .unwrap();
+
+        execute_file_transfer(&fixture.source, &fixture.destination, &file).unwrap();
+
+        let destination = destination_for_file(&fixture.destination, &file)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+
+        append_journal_result(
+            &path,
+            &mut journal,
+            ExecutionItem {
+                relative_path: file.relative_path.clone(),
+                destination,
+                status: ExecutionStatus::Archived,
+                detail: None,
+            },
+            file.size,
+        )
+        .unwrap();
+
+        let stored = read_archive_journal(&path).unwrap();
+
+        assert_eq!(stored.state, JournalState::InProgress);
+        assert_eq!(stored.result.archived_files, 1);
+        assert_eq!(stored.result.archived_size, file.size);
+        assert_eq!(stored.result.items.len(), 1);
+        assert_eq!(stored.result.items[0].status, ExecutionStatus::Archived);
+    }
+
+    #[test]
+    fn journal_is_only_completed_explicitly() {
+        let fixture = TestFixture::new("journal-complete");
+
+        let file = fixture.create_source_file("report.txt", b"report", 2020);
+
+        let (path, mut journal) =
+            create_archive_journal(&fixture.destination, &fixture.source, &[file]).unwrap();
+
         assert_eq!(
-            manifest.result.items[0].relative_path,
-            "Accounts/report.txt"
+            read_archive_journal(&path).unwrap().state,
+            JournalState::InProgress
         );
-        assert_eq!(manifest.result.items[0].status, ExecutionStatus::Archived);
+
+        complete_archive_journal(&path, &mut journal).unwrap();
+
+        assert_eq!(
+            read_archive_journal(&path).unwrap().state,
+            JournalState::Completed
+        );
+    }
+
+    #[test]
+    fn unfinished_journal_is_detectable_after_interruption() {
+        let fixture = TestFixture::new("journal-interrupted");
+
+        let file = fixture.create_source_file("report.txt", b"report", 2020);
+
+        let (path, _) =
+            create_archive_journal(&fixture.destination, &fixture.source, &[file]).unwrap();
+
+        // Simulate the app stopping without completing the journal.
+        let recovered = read_archive_journal(&path).unwrap();
+
+        assert_eq!(recovered.state, JournalState::InProgress);
+        assert_eq!(recovered.planned_files, 1);
     }
 
     #[test]
