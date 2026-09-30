@@ -1219,6 +1219,74 @@ fn inspect_interrupted_journal(
     }))
 }
 
+#[derive(Debug, PartialEq)]
+struct InterruptedJournalDiscovery {
+    journal_path: PathBuf,
+    operation_id: String,
+    relative_path: Option<String>,
+    verification: Option<InterruptedFileVerification>,
+}
+
+fn discover_interrupted_journals(
+    destination_root: &Path,
+) -> Result<Vec<InterruptedJournalDiscovery>, String> {
+    let manifests = destination_root.join(".archiver").join("manifests");
+
+    match fs::symlink_metadata(&manifests) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Vec::new());
+        }
+        Err(_) => {
+            return Err("Could not inspect archive manifests folder.".to_string());
+        }
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err("Archive manifests folder is unsafe.".to_string());
+            }
+        }
+    }
+
+    let entries = fs::read_dir(&manifests)
+        .map_err(|_| "Could not read archive manifests folder.".to_string())?;
+
+    let mut discoveries = Vec::new();
+
+    for entry in entries {
+        let entry = entry.map_err(|_| "Could not inspect an archive manifest.".to_string())?;
+        let path = entry.path();
+
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|_| "Could not inspect an archive manifest.".to_string())?;
+
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            continue;
+        }
+
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+
+        let journal = read_archive_journal(&path)?;
+
+        if journal.state == JournalState::Completed {
+            continue;
+        }
+
+        let inspection = inspect_interrupted_journal(&path)?;
+
+        discoveries.push(InterruptedJournalDiscovery {
+            journal_path: path,
+            operation_id: journal.operation_id,
+            relative_path: inspection.as_ref().map(|value| value.relative_path.clone()),
+            verification: inspection.map(|value| value.verification),
+        });
+    }
+
+    discoveries.sort_by(|left, right| left.journal_path.cmp(&right.journal_path));
+
+    Ok(discoveries)
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ArchiveExecutionResponse {
@@ -2412,6 +2480,80 @@ mod tests {
         complete_archive_journal(&path, &mut journal).unwrap();
 
         assert_eq!(inspect_interrupted_journal(&path).unwrap(), None);
+    }
+
+    #[test]
+    fn recovery_discovery_returns_empty_when_no_manifests_exist() {
+        let fixture = TestFixture::new("discover-no-manifests");
+
+        let discoveries = discover_interrupted_journals(&fixture.destination).unwrap();
+
+        assert!(discoveries.is_empty());
+    }
+
+    #[test]
+    fn recovery_discovery_finds_unfinished_journal() {
+        let fixture = TestFixture::new("discover-unfinished");
+        let file = fixture.create_source_file("Accounts/report.txt", b"report", 2020);
+
+        let (path, mut journal) = create_archive_journal(
+            &fixture.destination,
+            &fixture.source,
+            std::slice::from_ref(&file),
+        )
+        .unwrap();
+
+        set_journal_active_file(&path, &mut journal, &file).unwrap();
+
+        let discoveries = discover_interrupted_journals(&fixture.destination).unwrap();
+
+        assert_eq!(discoveries.len(), 1);
+        assert_eq!(discoveries[0].journal_path, path);
+        assert_eq!(
+            discoveries[0].relative_path.as_deref(),
+            Some("Accounts/report.txt")
+        );
+        assert_eq!(
+            discoveries[0].verification,
+            Some(InterruptedFileVerification::SourceVerified)
+        );
+    }
+
+    #[test]
+    fn recovery_discovery_ignores_completed_journal() {
+        let fixture = TestFixture::new("discover-completed");
+        let file = fixture.create_source_file("report.txt", b"report", 2020);
+
+        let (path, mut journal) = create_archive_journal(
+            &fixture.destination,
+            &fixture.source,
+            std::slice::from_ref(&file),
+        )
+        .unwrap();
+
+        complete_archive_journal(&path, &mut journal).unwrap();
+
+        let discoveries = discover_interrupted_journals(&fixture.destination).unwrap();
+
+        assert!(discoveries.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_discovery_rejects_symlinked_manifests_folder() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = TestFixture::new("discover-symlinked-manifests");
+        let archiver = fixture.destination.join(".archiver");
+        let outside = fixture.root.join("outside-manifests");
+
+        fs::create_dir_all(&archiver).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, archiver.join("manifests")).unwrap();
+
+        let error = discover_interrupted_journals(&fixture.destination).unwrap_err();
+
+        assert_eq!(error, "Archive manifests folder is unsafe.");
     }
 
     #[test]
