@@ -713,6 +713,42 @@ fn execute_file_transfer(
     Ok(())
 }
 
+#[derive(Debug, PartialEq)]
+enum InterruptedFileState {
+    SourceOnly,
+    SourceAndTemporary,
+    SourceAndDestination,
+    DestinationOnly,
+    Missing,
+    Ambiguous,
+}
+
+fn interrupted_file_state(
+    source_root: &Path,
+    destination_root: &Path,
+    file: &ArchiveFile,
+) -> Result<InterruptedFileState, TransferFailure> {
+    let relative_path = safe_relative_path(&file.relative_path)?;
+    let source_path = source_root.join(&relative_path);
+    let destination_path = destination_for_file(destination_root, file)?;
+    let temporary_path = temporary_path_for(&destination_path)?;
+
+    let source_exists = fs::symlink_metadata(&source_path).is_ok();
+    let destination_exists = fs::symlink_metadata(&destination_path).is_ok();
+    let temporary_exists = fs::symlink_metadata(&temporary_path).is_ok();
+
+    Ok(
+        match (source_exists, temporary_exists, destination_exists) {
+            (true, false, false) => InterruptedFileState::SourceOnly,
+            (true, true, false) => InterruptedFileState::SourceAndTemporary,
+            (true, false, true) => InterruptedFileState::SourceAndDestination,
+            (false, false, true) => InterruptedFileState::DestinationOnly,
+            (false, false, false) => InterruptedFileState::Missing,
+            _ => InterruptedFileState::Ambiguous,
+        },
+    )
+}
+
 static ARCHIVE_EXECUTION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Debug, Deserialize, PartialEq, Serialize)]
@@ -1895,6 +1931,80 @@ mod tests {
         assert_eq!(recovered.active_file, None);
         assert_eq!(recovered.result.archived_files, 1);
         assert_eq!(recovered.result.items.len(), 1);
+    }
+
+    #[test]
+    fn interrupted_file_state_detects_source_only() {
+        let fixture = TestFixture::new("recovery-source-only");
+        let file = fixture.create_source_file("report.txt", b"report", 2020);
+
+        assert_eq!(
+            interrupted_file_state(&fixture.source, &fixture.destination, &file).unwrap(),
+            InterruptedFileState::SourceOnly
+        );
+    }
+
+    #[test]
+    fn interrupted_file_state_detects_source_and_temporary() {
+        let fixture = TestFixture::new("recovery-source-temp");
+        let file = fixture.create_source_file("report.txt", b"report", 2020);
+
+        let destination = destination_for_file(&fixture.destination, &file).unwrap();
+        fs::create_dir_all(destination.parent().unwrap()).unwrap();
+
+        let temporary = temporary_path_for(&destination).unwrap();
+        fs::write(&temporary, b"report").unwrap();
+
+        assert_eq!(
+            interrupted_file_state(&fixture.source, &fixture.destination, &file).unwrap(),
+            InterruptedFileState::SourceAndTemporary
+        );
+    }
+
+    #[test]
+    fn interrupted_file_state_detects_source_and_destination() {
+        let fixture = TestFixture::new("recovery-source-destination");
+        let file = fixture.create_source_file("report.txt", b"report", 2020);
+
+        let destination = destination_for_file(&fixture.destination, &file).unwrap();
+        fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        fs::write(&destination, b"report").unwrap();
+
+        assert_eq!(
+            interrupted_file_state(&fixture.source, &fixture.destination, &file).unwrap(),
+            InterruptedFileState::SourceAndDestination
+        );
+    }
+
+    #[test]
+    fn interrupted_file_state_detects_destination_only() {
+        let fixture = TestFixture::new("recovery-destination-only");
+        let file = fixture.create_source_file("report.txt", b"report", 2020);
+
+        let source = fixture.source.join("report.txt");
+        let destination = destination_for_file(&fixture.destination, &file).unwrap();
+
+        fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        fs::write(&destination, b"report").unwrap();
+        fs::remove_file(&source).unwrap();
+
+        assert_eq!(
+            interrupted_file_state(&fixture.source, &fixture.destination, &file).unwrap(),
+            InterruptedFileState::DestinationOnly
+        );
+    }
+
+    #[test]
+    fn interrupted_file_state_detects_missing_file() {
+        let fixture = TestFixture::new("recovery-missing");
+        let file = fixture.create_source_file("report.txt", b"report", 2020);
+
+        fs::remove_file(fixture.source.join("report.txt")).unwrap();
+
+        assert_eq!(
+            interrupted_file_state(&fixture.source, &fixture.destination, &file).unwrap(),
+            InterruptedFileState::Missing
+        );
     }
 
     #[test]
