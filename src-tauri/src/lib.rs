@@ -749,6 +749,93 @@ fn interrupted_file_state(
     )
 }
 
+#[derive(Debug, PartialEq)]
+enum InterruptedFileVerification {
+    SourceVerified,
+    TemporaryVerified,
+    DestinationVerified,
+    DestinationPlausible,
+    SourceChanged,
+    TemporaryUnverified,
+    DestinationUnverified,
+    Missing,
+    Ambiguous,
+}
+
+fn regular_file_with_size(path: &Path, expected_size: u64) -> bool {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            !metadata.file_type().is_symlink()
+                && metadata.is_file()
+                && metadata.len() == expected_size
+        }
+        Err(_) => false,
+    }
+}
+
+fn verify_interrupted_file(
+    source_root: &Path,
+    destination_root: &Path,
+    file: &ArchiveFile,
+) -> Result<InterruptedFileVerification, TransferFailure> {
+    let relative_path = safe_relative_path(&file.relative_path)?;
+    let source_path = source_root.join(&relative_path);
+    let destination_path = destination_for_file(destination_root, file)?;
+    let temporary_path = temporary_path_for(&destination_path)?;
+
+    match interrupted_file_state(source_root, destination_root, file)? {
+        InterruptedFileState::SourceOnly => {
+            if verify_source(&source_path, file.size, file.modified_ms).is_ok() {
+                Ok(InterruptedFileVerification::SourceVerified)
+            } else {
+                Ok(InterruptedFileVerification::SourceChanged)
+            }
+        }
+
+        InterruptedFileState::SourceAndTemporary => {
+            if verify_source(&source_path, file.size, file.modified_ms).is_err() {
+                return Ok(InterruptedFileVerification::SourceChanged);
+            }
+
+            if regular_file_with_size(&temporary_path, file.size)
+                && files_equal(&source_path, &temporary_path)?
+            {
+                Ok(InterruptedFileVerification::TemporaryVerified)
+            } else {
+                Ok(InterruptedFileVerification::TemporaryUnverified)
+            }
+        }
+
+        InterruptedFileState::SourceAndDestination => {
+            if verify_source(&source_path, file.size, file.modified_ms).is_err() {
+                return Ok(InterruptedFileVerification::SourceChanged);
+            }
+
+            if regular_file_with_size(&destination_path, file.size)
+                && files_equal(&source_path, &destination_path)?
+            {
+                Ok(InterruptedFileVerification::DestinationVerified)
+            } else {
+                Ok(InterruptedFileVerification::DestinationUnverified)
+            }
+        }
+
+        InterruptedFileState::DestinationOnly => {
+            // With the source gone there is nothing left to byte-compare
+            // against. Size and file type are useful evidence, but not proof.
+            if regular_file_with_size(&destination_path, file.size) {
+                Ok(InterruptedFileVerification::DestinationPlausible)
+            } else {
+                Ok(InterruptedFileVerification::DestinationUnverified)
+            }
+        }
+
+        InterruptedFileState::Missing => Ok(InterruptedFileVerification::Missing),
+
+        InterruptedFileState::Ambiguous => Ok(InterruptedFileVerification::Ambiguous),
+    }
+}
+
 static ARCHIVE_EXECUTION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Debug, Deserialize, PartialEq, Serialize)]
@@ -2064,6 +2151,112 @@ mod tests {
         assert_eq!(
             interrupted_file_state(&fixture.source, &fixture.destination, &file).unwrap(),
             InterruptedFileState::Missing
+        );
+    }
+
+    #[test]
+    fn interrupted_verification_accepts_unchanged_source() {
+        let fixture = TestFixture::new("verify-recovery-source");
+        let file = fixture.create_source_file("report.txt", b"report", 2020);
+
+        assert_eq!(
+            verify_interrupted_file(&fixture.source, &fixture.destination, &file).unwrap(),
+            InterruptedFileVerification::SourceVerified
+        );
+    }
+
+    #[test]
+    fn interrupted_verification_detects_changed_source() {
+        let fixture = TestFixture::new("verify-recovery-source-changed");
+        let file = fixture.create_source_file("report.txt", b"report", 2020);
+
+        fs::write(fixture.source.join("report.txt"), b"changed").unwrap();
+
+        assert_eq!(
+            verify_interrupted_file(&fixture.source, &fixture.destination, &file).unwrap(),
+            InterruptedFileVerification::SourceChanged
+        );
+    }
+
+    #[test]
+    fn interrupted_verification_accepts_matching_temporary_file() {
+        let fixture = TestFixture::new("verify-recovery-temp");
+        let file = fixture.create_source_file("report.txt", b"report", 2020);
+
+        let destination = destination_for_file(&fixture.destination, &file).unwrap();
+        fs::create_dir_all(destination.parent().unwrap()).unwrap();
+
+        let temporary = temporary_path_for(&destination).unwrap();
+        fs::write(&temporary, b"report").unwrap();
+
+        assert_eq!(
+            verify_interrupted_file(&fixture.source, &fixture.destination, &file).unwrap(),
+            InterruptedFileVerification::TemporaryVerified
+        );
+    }
+
+    #[test]
+    fn interrupted_verification_rejects_same_size_corrupt_temporary_file() {
+        let fixture = TestFixture::new("verify-recovery-temp-corrupt");
+        let file = fixture.create_source_file("report.txt", b"report", 2020);
+
+        let destination = destination_for_file(&fixture.destination, &file).unwrap();
+        fs::create_dir_all(destination.parent().unwrap()).unwrap();
+
+        let temporary = temporary_path_for(&destination).unwrap();
+        fs::write(&temporary, b"xxxxxx").unwrap();
+
+        assert_eq!(
+            verify_interrupted_file(&fixture.source, &fixture.destination, &file).unwrap(),
+            InterruptedFileVerification::TemporaryUnverified
+        );
+    }
+
+    #[test]
+    fn interrupted_verification_accepts_matching_destination() {
+        let fixture = TestFixture::new("verify-recovery-destination");
+        let file = fixture.create_source_file("report.txt", b"report", 2020);
+
+        let destination = destination_for_file(&fixture.destination, &file).unwrap();
+        fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        fs::write(&destination, b"report").unwrap();
+
+        assert_eq!(
+            verify_interrupted_file(&fixture.source, &fixture.destination, &file).unwrap(),
+            InterruptedFileVerification::DestinationVerified
+        );
+    }
+
+    #[test]
+    fn interrupted_verification_rejects_same_size_corrupt_destination() {
+        let fixture = TestFixture::new("verify-recovery-destination-corrupt");
+        let file = fixture.create_source_file("report.txt", b"report", 2020);
+
+        let destination = destination_for_file(&fixture.destination, &file).unwrap();
+        fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        fs::write(&destination, b"xxxxxx").unwrap();
+
+        assert_eq!(
+            verify_interrupted_file(&fixture.source, &fixture.destination, &file).unwrap(),
+            InterruptedFileVerification::DestinationUnverified
+        );
+    }
+
+    #[test]
+    fn interrupted_verification_treats_destination_only_as_plausible_not_verified() {
+        let fixture = TestFixture::new("verify-recovery-destination-only");
+        let file = fixture.create_source_file("report.txt", b"report", 2020);
+
+        let source = fixture.source.join("report.txt");
+        let destination = destination_for_file(&fixture.destination, &file).unwrap();
+
+        fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        fs::write(&destination, b"report").unwrap();
+        fs::remove_file(&source).unwrap();
+
+        assert_eq!(
+            verify_interrupted_file(&fixture.source, &fixture.destination, &file).unwrap(),
+            InterruptedFileVerification::DestinationPlausible
         );
     }
 
