@@ -1037,6 +1037,25 @@ fn validate_execution_roots(
     source: &Path,
     destination: &Path,
 ) -> Result<(PathBuf, PathBuf), String> {
+    // Check the paths exactly as supplied before canonicalising them.
+    // Canonicalisation follows symlinks, so checking only afterwards would
+    // make a selected symlink indistinguishable from its target.
+    let supplied_source_metadata = fs::symlink_metadata(source)
+        .map_err(|_| "The source folder is no longer available.".to_string())?;
+
+    let supplied_destination_metadata = fs::symlink_metadata(destination)
+        .map_err(|_| "The archive destination is no longer available.".to_string())?;
+
+    if supplied_source_metadata.file_type().is_symlink() || !supplied_source_metadata.is_dir() {
+        return Err("The source folder is not a regular directory.".to_string());
+    }
+
+    if supplied_destination_metadata.file_type().is_symlink()
+        || !supplied_destination_metadata.is_dir()
+    {
+        return Err("The archive destination is not a regular directory.".to_string());
+    }
+
     let source_root = fs::canonicalize(source)
         .map_err(|_| "The source folder is no longer available.".to_string())?;
 
@@ -1952,6 +1971,36 @@ mod tests {
         assert_eq!(journal.state, JournalState::Completed);
         assert_eq!(journal.result.archived_files, 2);
         assert_eq!(journal.result.items.len(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execution_roots_reject_symlinked_source_root() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = TestFixture::new("symlink-source-root");
+        let source_link = fixture.root.join("source-link");
+
+        symlink(&fixture.source, &source_link).unwrap();
+
+        let result = validate_execution_roots(&source_link, &fixture.destination);
+
+        assert!(result.is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execution_roots_reject_symlinked_destination_root() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = TestFixture::new("symlink-destination-root");
+        let destination_link = fixture.root.join("destination-link");
+
+        symlink(&fixture.destination, &destination_link).unwrap();
+
+        let result = validate_execution_roots(&fixture.source, &destination_link);
+
+        assert!(result.is_err());
     }
 
     #[test]
