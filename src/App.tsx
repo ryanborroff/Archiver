@@ -44,6 +44,26 @@ type ArchivePlan = {
   missingFiles: number;
 };
 
+type ExecutionItem = {
+  relativePath: string;
+  destination: string;
+  status: "archived" | "sourceRetained" | "failed";
+  detail: string | null;
+};
+
+type ExecutionResult = {
+  items: ExecutionItem[];
+  archivedFiles: number;
+  archivedSize: number;
+  sourceRetainedFiles: number;
+  failedFiles: number;
+};
+
+type ArchiveExecutionResponse = {
+  result: ExecutionResult;
+  journalPath: string;
+};
+
 function formatBytes(bytes: number) {
   if (bytes === 0) return "0 B";
 
@@ -68,13 +88,18 @@ function App() {
   const [selectedYear, setSelectedYear] = useState<number | null>(null);
   const [plan, setPlan] = useState<ArchivePlan | null>(null);
   const [planning, setPlanning] = useState(false);
+  const [confirmingArchive, setConfirmingArchive] = useState(false);
+  const [archiving, setArchiving] = useState(false);
+  const [execution, setExecution] =
+    useState<ArchiveExecutionResponse | null>(null);
 
   const cutoff = Number(cutoffYear);
   const canScan =
     source.length > 0 &&
     destination.length > 0 &&
     Number.isInteger(cutoff) &&
-    cutoff >= 1970;
+    cutoff >= 1970 &&
+    !archiving;
 
   const heading = useMemo(() => {
     if (!result) return null;
@@ -99,6 +124,8 @@ function App() {
 
     setResult(null);
     setPlan(null);
+    setExecution(null);
+    setConfirmingArchive(false);
     setShowFiles(false);
     setSelectedYear(null);
     setError("");
@@ -110,6 +137,8 @@ function App() {
     setScanning(true);
     setError("");
     setPlan(null);
+    setExecution(null);
+    setConfirmingArchive(false);
     setShowFiles(false);
     setSelectedYear(null);
 
@@ -134,6 +163,8 @@ function App() {
 
     setPlanning(true);
     setError("");
+    setExecution(null);
+    setConfirmingArchive(false);
 
     try {
       const archivePlan = await invoke<ArchivePlan>("plan_archive", {
@@ -148,6 +179,70 @@ function App() {
       setError(String(reason));
     } finally {
       setPlanning(false);
+    }
+  }
+
+  async function executeArchive() {
+    if (!result || !plan || !source || !destination) return;
+
+    const planIsSafe =
+      plan.readyFiles === result.totalFiles &&
+      plan.conflicts === 0 &&
+      plan.changedFiles === 0 &&
+      plan.missingFiles === 0;
+
+    if (!planIsSafe) {
+      setError(
+        "The archive plan is no longer fully ready. Review the archive again before continuing.",
+      );
+      setConfirmingArchive(false);
+      return;
+    }
+
+    setArchiving(true);
+    setError("");
+    setExecution(null);
+
+    let response: ArchiveExecutionResponse;
+
+    try {
+      response = await invoke<ArchiveExecutionResponse>(
+        "execute_archive",
+        {
+          source,
+          archiveDestination: destination,
+          files: result.files,
+        },
+      );
+    } catch (reason) {
+      setError(`Archive did not complete: ${String(reason)}`);
+      setConfirmingArchive(false);
+      setArchiving(false);
+      return;
+    }
+
+    // The archive operation itself has completed successfully at this point.
+    // Record that result before attempting the non-destructive UI refresh.
+    setExecution(response);
+    setPlan(null);
+    setConfirmingArchive(false);
+    setShowFiles(false);
+    setSelectedYear(null);
+    setArchiving(false);
+
+    try {
+      const refreshed = await invoke<ScanResult>("scan_archive", {
+        source,
+        archiveDestination: destination,
+        cutoffYear: cutoff,
+      });
+
+      setResult(refreshed);
+    } catch (reason) {
+      setResult(null);
+      setError(
+        `Archive completed successfully, but the source could not be refreshed: ${String(reason)}`,
+      );
     }
   }
 
@@ -166,7 +261,11 @@ function App() {
         <section className="controls" aria-label="Archive settings">
           <div className="field">
             <label>Source</label>
-            <button className="path-button" onClick={() => chooseFolder("source")}>
+            <button
+              className="path-button"
+              disabled={archiving}
+              onClick={() => chooseFolder("source")}
+            >
               <span className={source ? "" : "placeholder"}>
                 {source || "Choose a folder or drive"}
               </span>
@@ -178,6 +277,7 @@ function App() {
             <label>Archive to</label>
             <button
               className="path-button"
+              disabled={archiving}
               onClick={() => chooseFolder("destination")}
             >
               <span className={destination ? "" : "placeholder"}>
@@ -195,10 +295,13 @@ function App() {
               min="1970"
               max="9999"
               value={cutoffYear}
+              disabled={archiving}
               onChange={(event) => {
                 setCutoffYear(event.currentTarget.value);
                 setResult(null);
                 setPlan(null);
+                setExecution(null);
+                setConfirmingArchive(false);
                 setShowFiles(false);
                 setSelectedYear(null);
               }}
@@ -402,19 +505,103 @@ function App() {
             </div>
 
             <div className="plan-footer">
-              <span>
-                Review only. Archiver still cannot move or delete files.
-              </span>
-              <button className="archive-button" disabled>
-                Archive files
-              </button>
+              {!confirmingArchive ? (
+                <>
+                  <span>
+                    Nothing has moved yet. Archive only when this plan looks
+                    right.
+                  </span>
+                  <button
+                    className="archive-button"
+                    disabled={
+                      archiving ||
+                      plan.readyFiles === 0 ||
+                      plan.conflicts > 0 ||
+                      plan.changedFiles > 0 ||
+                      plan.missingFiles > 0 ||
+                      !result ||
+                      plan.readyFiles !== result.totalFiles
+                    }
+                    onClick={() => setConfirmingArchive(true)}
+                  >
+                    Archive files
+                  </button>
+                </>
+              ) : (
+                <div className="archive-confirmation">
+                  <div>
+                    <strong>
+                      Archive {plan.readyFiles.toLocaleString()} files?
+                    </strong>
+                    <span>
+                      {formatBytes(plan.readySize)} will be copied, verified,
+                      then removed from the source.
+                    </span>
+                  </div>
+
+                  <div className="archive-confirmation-actions">
+                    <button
+                      className="secondary"
+                      disabled={archiving}
+                      onClick={() => setConfirmingArchive(false)}
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      className="archive-button"
+                      disabled={archiving}
+                      onClick={executeArchive}
+                    >
+                      {archiving ? "Archiving…" : "Confirm archive"}
+                    </button>
+                  </div>
+                </div>
+              )}
             </div>
           </section>
         )}
 
-        {!result && (
+        {execution && (
+          <section className="plan-panel execution-panel">
+            <div className="plan-heading">
+              <div>
+                <div className="eyebrow">ARCHIVE COMPLETE</div>
+                <h2>
+                  {execution.result.failedFiles === 0 &&
+                  execution.result.sourceRetainedFiles === 0
+                    ? "Archive complete"
+                    : "Archive completed with attention needed"}
+                </h2>
+              </div>
+
+              <div className="total">
+                <strong>
+                  {formatBytes(execution.result.archivedSize)}
+                </strong>
+                <span>
+                  {execution.result.archivedFiles.toLocaleString()} archived
+                </span>
+              </div>
+            </div>
+
+            {(execution.result.sourceRetainedFiles > 0 ||
+              execution.result.failedFiles > 0) && (
+              <p className="skipped">
+                {execution.result.sourceRetainedFiles.toLocaleString()} source
+                retained, {execution.result.failedFiles.toLocaleString()} failed.
+              </p>
+            )}
+
+            <p className="skipped">
+              Recovery record: {execution.journalPath}
+            </p>
+          </section>
+        )}
+
+        {!result && !execution && (
           <div className="safety-note">
-            Preview only. This version cannot move, rename or delete files.
+            Choose a source and archive folder, then scan to preview what would
+            move.
           </div>
         )}
       </section>

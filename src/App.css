@@ -471,3 +471,48 @@ button.year-row.selected {
   color: #86868b;
   font-size: 12px;
 }
+
+.archive-confirmation {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+}
+
+.archive-confirmation > div:first-child {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.archive-confirmation strong {
+  font-size: 14px;
+}
+
+.archive-confirmation span {
+  color: #86868b;
+  font-size: 12px;
+}
+
+.archive-confirmation-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-shrink: 0;
+}
+
+.execution-panel {
+  margin-top: 24px;
+}
+
+@media (max-width: 700px) {
+  .archive-confirmation {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .archive-confirmation-actions {
+    justify-content: flex-end;
+  }
+}
